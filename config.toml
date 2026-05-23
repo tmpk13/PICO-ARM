@@ -49,20 +49,20 @@ invert      = false
 [[boards.axes]]
 index       = 3
 target      = "y"
-sensitivity = 2000
+sensitivity = 1000
 deadzone    = 0.10
 invert      = true
 
 [[boards.axes]]
 index       = 0
-target      = "e"
+target      = "z"
 sensitivity = 800
 deadzone    = 0.15
 invert      = false
 
 [[boards.axes]]
 index       = 5
-target      = "z"
+target      = "e"
 sensitivity = 800
 deadzone    = 0.15
 invert      = false
