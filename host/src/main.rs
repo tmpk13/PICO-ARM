@@ -1,13 +1,16 @@
 // Host-side joystick driver for the SKR Pico firmware.
 //
-// Reads a TOML config describing which joystick axis/button maps to which
-// stepper axis, opens /dev/input/jsN, opens the firmware's USB CDC serial,
-// and translates stick deflections into `jog <axis> <signed_hz>` commands.
+// Reads a TOML config describing one or more boards. Each board has its
+// own USB CDC serial port and its own axis/button bindings, so a single
+// joystick can drive multiple SKR Picos (e.g. one arm split across two
+// boards). The reader thread is global; integrator state and serial I/O
+// are per-board.
 //
 //   tmc-new-era-host                   # uses ./config.toml
 //   tmc-new-era-host path/to/cfg.toml
 //
-// Stops cleanly on Ctrl-C, sending `jog * 0` to every axis first.
+// Stops cleanly on Ctrl-C, sending `jog * 0` + `disable all` to every
+// configured board first.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -27,8 +30,6 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 struct Config {
-    /// Path to the firmware's USB CDC serial device.
-    serial: String,
     /// Path to the joystick device. Linux `/dev/input/jsN`.
     device: String,
     /// Integrator tick rate. 40 Hz matches the reference. Clamped to [10,200].
@@ -44,14 +45,27 @@ struct Config {
     #[serde(default = "default_true")]
     safe_stop_on_exit: bool,
 
+    /// One entry per SKR Pico. Joystick events are dispatched to each
+    /// board independently based on its own axes/buttons bindings.
+    #[serde(default)]
+    boards: Vec<BoardConfig>,
+}
+
+fn default_poll_hz() -> u32 { 40 }
+fn default_true() -> bool { true }
+
+#[derive(Debug, Deserialize, Clone)]
+struct BoardConfig {
+    /// Path to this board's USB CDC serial device.
+    serial: String,
+    /// Friendly label used in log lines. Defaults to the serial path.
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     axes: Vec<AxisMap>,
     #[serde(default)]
     buttons: Vec<ButtonMap>,
 }
-
-fn default_poll_hz() -> u32 { 40 }
-fn default_true() -> bool { true }
 
 #[derive(Debug, Deserialize, Clone)]
 struct AxisMap {
@@ -122,8 +136,19 @@ struct Snapshot {
 }
 
 // --------------------------------------------------------------------------
+// Per-board serial handle: the label used in logs and the channel to the
+// writer thread.
+// --------------------------------------------------------------------------
+
+#[derive(Clone)]
+struct BoardLink {
+    label: String,
+    tx: Sender<String>,
+}
+
+// --------------------------------------------------------------------------
 // Serial setup: open port, version-handshake the firmware, then spawn one
-// writer thread and one drainer thread.
+// writer thread and one drainer thread per board.
 //
 // The drainer is critical: the firmware echoes each character and emits
 // "ok jog X N" + a prompt for every command. With ~40 commands/sec on a
@@ -195,12 +220,15 @@ fn parse_version(s: &str) -> Option<String> {
     None
 }
 
-fn spawn_serial_threads(mut port: Box<dyn serialport::SerialPort>) -> Result<Sender<String>> {
+fn spawn_serial_threads(
+    mut port: Box<dyn serialport::SerialPort>,
+    label: String,
+) -> Result<Sender<String>> {
     let mut reader = port.try_clone().context("cloning serial port for drainer")?;
     let (tx, rx) = channel::<String>();
 
     thread::Builder::new()
-        .name("serial-writer".into())
+        .name(format!("serial-writer:{label}"))
         .spawn(move || {
             for cmd in rx {
                 let _ = port.write_all(cmd.as_bytes());
@@ -209,7 +237,7 @@ fn spawn_serial_threads(mut port: Box<dyn serialport::SerialPort>) -> Result<Sen
         })?;
 
     thread::Builder::new()
-        .name("serial-drainer".into())
+        .name(format!("serial-drainer:{label}"))
         .spawn(move || {
             let mut buf = [0u8; 512];
             loop {
@@ -340,26 +368,28 @@ fn run_reader(
 }
 
 // --------------------------------------------------------------------------
-// Integrator: at poll_hz, computes each mapped axis's signed velocity and
-// streams jog commands.
+// Integrator: at poll_hz, for each board, computes each mapped axis's
+// signed velocity and streams jog commands to that board's serial writer.
 //
 // We *don't* dedup nonzero values - we resend them every tick so the
 // firmware's deadman watchdog stays fed. A single dropped packet (or a
 // stalled thread on either side) therefore halts motion at the watchdog
 // timeout instead of letting the arm coast. Zero is sent once on the
 // transition; the firmware doesn't need a heartbeat to stay stopped.
+//
+// Last-sent state is per-board so axis "x" on board 0 and axis "x" on
+// board 1 track independently.
 // --------------------------------------------------------------------------
 
 fn integrate_loop(
     cfg: &Config,
+    links: &[BoardLink],
     snapshot: Arc<Mutex<Snapshot>>,
     connected: Arc<AtomicBool>,
-    tx: Sender<String>,
 ) {
     let period = Duration::from_secs_f32(1.0 / cfg.poll_hz.clamp(10, 200) as f32);
-    // Last (sign, magnitude) sent per target. Only consulted to detect the
-    // moving -> stopped transition so we don't spam zeros.
-    let mut last: HashMap<&'static str, (i32, u32)> = HashMap::new();
+    let mut last: Vec<HashMap<&'static str, (i32, u32)>> =
+        (0..cfg.boards.len()).map(|_| HashMap::new()).collect();
     let mut next_tick = Instant::now();
 
     loop {
@@ -377,48 +407,51 @@ fn integrate_loop(
             Vec::new()
         };
 
-        for map in &cfg.axes {
-            let Some(target) = axis_token(&map.target) else { continue };
-            let raw = match axes_state.get(map.index) {
-                Some(v) => *v as f32 / JS_MAX,
-                None => 0.0,
-            };
-            let raw = if map.invert { -raw } else { raw };
-            let dz = map.deadzone.clamp(0.0, 0.95);
-            let mag = raw.abs();
-            let signed_v = if mag < dz {
-                0.0
-            } else {
-                let norm = (mag - dz) / (1.0 - dz) * raw.signum();
-                norm * map.sensitivity
-            };
+        for (board_idx, board) in cfg.boards.iter().enumerate() {
+            let link = &links[board_idx];
+            for map in &board.axes {
+                let Some(target) = axis_token(&map.target) else { continue };
+                let raw = match axes_state.get(map.index) {
+                    Some(v) => *v as f32 / JS_MAX,
+                    None => 0.0,
+                };
+                let raw = if map.invert { -raw } else { raw };
+                let dz = map.deadzone.clamp(0.0, 0.95);
+                let mag = raw.abs();
+                let signed_v = if mag < dz {
+                    0.0
+                } else {
+                    let norm = (mag - dz) / (1.0 - dz) * raw.signum();
+                    norm * map.sensitivity
+                };
 
-            let (new_sign, new_mag): (i32, u32) = if signed_v.abs() < 1.0 {
-                (0, 0)
-            } else {
-                let s = if signed_v > 0.0 { 1 } else { -1 };
-                let m = ((signed_v.abs() / 25.0).round() as u32).max(1) * 25;
-                (s, m)
-            };
+                let (new_sign, new_mag): (i32, u32) = if signed_v.abs() < 1.0 {
+                    (0, 0)
+                } else {
+                    let s = if signed_v > 0.0 { 1 } else { -1 };
+                    let m = ((signed_v.abs() / 25.0).round() as u32).max(1) * 25;
+                    (s, m)
+                };
 
-            let prev = last.get(&target).copied().unwrap_or((0, 0));
-            // Idle -> idle: nothing to send.
-            if new_mag == 0 && prev.1 == 0 {
-                continue;
+                let prev = last[board_idx].get(&target).copied().unwrap_or((0, 0));
+                // Idle -> idle: nothing to send.
+                if new_mag == 0 && prev.1 == 0 {
+                    continue;
+                }
+                last[board_idx].insert(target, (new_sign, new_mag));
+                let signed_hz: i32 = new_sign * new_mag as i32;
+                send(link, &format!("jog {target} {signed_hz}\r\n"), cfg.log);
             }
-            last.insert(target, (new_sign, new_mag));
-            let signed_hz: i32 = new_sign * new_mag as i32;
-            send(&tx, &format!("jog {target} {signed_hz}\r\n"), cfg.log);
         }
     }
 }
 
-fn send(tx: &Sender<String>, cmd: &str, log: bool) {
+fn send(link: &BoardLink, cmd: &str, log: bool) {
     if log {
         let trimmed = cmd.trim_end();
-        println!("> {trimmed}");
+        println!("[{}] > {trimmed}", link.label);
     }
-    let _ = tx.send(cmd.to_string());
+    let _ = link.tx.send(cmd.to_string());
 }
 
 // --------------------------------------------------------------------------
@@ -432,55 +465,79 @@ fn load_config(path: &str) -> Result<Config> {
         .read_to_string(&mut s)?;
     let cfg: Config = toml::from_str(&s)
         .with_context(|| format!("parsing config {path}"))?;
+    if cfg.boards.is_empty() {
+        bail!("config has no [[boards]] entries");
+    }
     Ok(cfg)
+}
+
+fn board_label(b: &BoardConfig) -> String {
+    b.name.clone().unwrap_or_else(|| b.serial.clone())
 }
 
 fn main() -> Result<()> {
     let path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".into());
     let cfg = Arc::new(load_config(&path)?);
 
-    // Open the port, do the version handshake before anything else, then
-    // hand the port off to the writer + drainer threads.
-    let mut port = open_port(&cfg.serial)?;
-    // Give the firmware a moment to enumerate / settle on a fresh connect
-    // (the banner takes a few hundred ms to flush after we open).
-    thread::sleep(Duration::from_millis(300));
+    // For each board: open the port, do the version handshake, then hand
+    // the port off to a writer + drainer pair. Collect the per-board send
+    // channels into `links`.
+    let mut links: Vec<BoardLink> = Vec::with_capacity(cfg.boards.len());
+    for board in &cfg.boards {
+        let label = board_label(board);
+        let mut port = open_port(&board.serial)
+            .with_context(|| format!("board {label}"))?;
+        // Give the firmware a moment to enumerate / settle on a fresh
+        // connect (the banner takes a few hundred ms to flush after we
+        // open).
+        thread::sleep(Duration::from_millis(300));
 
-    let fw_version = handshake_version(&mut port)?;
-    eprintln!("firmware v{fw_version}, host v{HOST_VERSION}");
-    if fw_version != HOST_VERSION {
-        bail!(
-            "version mismatch: firmware v{fw_version} != host v{HOST_VERSION}. \
-             Reflash firmware/target/thumbv6m-none-eabi/release/tmc-new-era.uf2 \
-             or rebuild the host."
-        );
+        let fw_version = handshake_version(&mut port)
+            .with_context(|| format!("board {label}"))?;
+        eprintln!("board {label}: firmware v{fw_version}, host v{HOST_VERSION}");
+        if fw_version != HOST_VERSION {
+            bail!(
+                "board {label}: version mismatch: firmware v{fw_version} != host v{HOST_VERSION}. \
+                 Reflash firmware/target/thumbv6m-none-eabi/release/tmc-new-era.uf2 \
+                 or rebuild the host."
+            );
+        }
+
+        let tx = spawn_serial_threads(port, label.clone())?;
+        links.push(BoardLink { label, tx });
     }
 
-    let tx = spawn_serial_threads(port)?;
-
     if cfg.enable_on_start {
-        send(&tx, "enable all\r\n", cfg.log);
+        for link in &links {
+            send(link, "enable all\r\n", cfg.log);
+        }
     }
 
     let snapshot = Arc::new(Mutex::new(Snapshot::default()));
     let connected = Arc::new(AtomicBool::new(false));
 
     // Joystick reader thread - supervises (re)open / read / disconnect.
+    // Captures every board's buttons + tx so a single press can fan out to
+    // whichever boards are listening for that index.
     let snap_for_reader = snapshot.clone();
-    let buttons = cfg.buttons.clone();
-    let tx_for_buttons = tx.clone();
-    let log_buttons = cfg.log;
     let device = cfg.device.clone();
     let connected_for_reader = connected.clone();
+    let log_buttons = cfg.log;
+    let boards_for_buttons: Vec<(BoardLink, Vec<ButtonMap>)> = cfg.boards.iter()
+        .zip(links.iter().cloned())
+        .map(|(b, link)| (link, b.buttons.clone()))
+        .collect();
     thread::Builder::new().name("js-reader".into()).spawn(move || {
         reader_supervisor(
             device,
             snap_for_reader,
             move |btn| {
-                if let Some(b) = buttons.iter().find(|b| b.index as u8 == btn) {
-                    if let Some(target) = axis_token(&b.target) {
-                        let cmd = format!("move {target} {} {}\r\n", b.delta, b.hz);
-                        send(&tx_for_buttons, &cmd, log_buttons);
+                for (link, buttons) in &boards_for_buttons {
+                    for b in buttons.iter().filter(|b| b.index as u8 == btn) {
+                        if let Some(target) = axis_token(&b.target) {
+                            let cmd = format!("move {target} {} {}\r\n", b.delta, b.hz);
+                            send(link, &cmd, log_buttons);
+                        }
                     }
                 }
             },
@@ -490,15 +547,17 @@ fn main() -> Result<()> {
 
     // Integrator thread.
     let cfg_for_int = cfg.clone();
-    let tx_for_int = tx.clone();
+    let links_for_int = links.clone();
     let connected_for_int = connected.clone();
     thread::Builder::new().name("integrator".into()).spawn(move || {
-        integrate_loop(&cfg_for_int, snapshot, connected_for_int, tx_for_int);
+        integrate_loop(&cfg_for_int, &links_for_int, snapshot, connected_for_int);
     })?;
 
+    let total_axes: usize = cfg.boards.iter().map(|b| b.axes.len()).sum();
+    let total_buttons: usize = cfg.boards.iter().map(|b| b.buttons.len()).sum();
     eprintln!(
-        "tmc-new-era-host: serial={} device={} poll_hz={} axes={} buttons={}",
-        cfg.serial, cfg.device, cfg.poll_hz, cfg.axes.len(), cfg.buttons.len()
+        "tmc-new-era-host: device={} poll_hz={} boards={} axes={} buttons={}",
+        cfg.device, cfg.poll_hz, cfg.boards.len(), total_axes, total_buttons
     );
     eprintln!("Ctrl-C to stop.");
 
@@ -507,10 +566,12 @@ fn main() -> Result<()> {
     loop {
         if STOP.load(std::sync::atomic::Ordering::SeqCst) {
             if cfg.safe_stop_on_exit {
-                for a in ["x", "y", "z", "e"] {
-                    send(&tx, &format!("jog {a} 0\r\n"), cfg.log);
+                for link in &links {
+                    for a in ["x", "y", "z", "e"] {
+                        send(link, &format!("jog {a} 0\r\n"), cfg.log);
+                    }
+                    send(link, "disable all\r\n", cfg.log);
                 }
-                send(&tx, "disable all\r\n", cfg.log);
                 thread::sleep(Duration::from_millis(150));
             }
             std::process::exit(130);

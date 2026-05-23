@@ -1,14 +1,18 @@
 # tmc-new-era host config.
 #
-# Each [[axes]] block maps one joystick axis (index N on /dev/input/jsN) to
-# one stepper axis on the SKR Pico. At full deflection the firmware will be
-# commanded `jog <target> <+- sensitivity>` (in steps/sec). Inside the
-# deadzone the axis is treated as zero (and the firmware is told to stop).
+# One joystick can drive any number of SKR Picos. Each [[boards]] block
+# declares one board's serial port plus its own axis / button bindings.
+# Joystick axes and buttons are dispatched to every board that listed
+# them, so you can split joystick controls between boards however you
+# like (e.g. left stick on board A, right stick on board B).
 #
-# Each [[buttons]] block sends a single one-shot `move` on press.
-
-# Path to the firmware's USB CDC serial port.
-serial  = "/dev/ttyACM1"
+# Each [[boards.axes]] block maps one joystick axis (index N on
+# /dev/input/jsN) to one stepper axis on that board. At full deflection
+# the firmware will be commanded `jog <target> <+- sensitivity>` (in
+# steps/sec). Inside the deadzone the axis is treated as zero (and the
+# firmware is told to stop).
+#
+# Each [[boards.buttons]] block sends a single one-shot `move` on press.
 
 # Linux joystick device. Use `ls /dev/input/js*` to find yours.
 device  = "/dev/input/js0"
@@ -19,9 +23,15 @@ poll_hz = 40
 # Print every command sent to the firmware. Handy when first wiring up.
 log = true
 
-# Send `enable all` once on startup, and `disable all` on Ctrl-C.
+# Send `enable all` to every board on startup, and `disable all` on Ctrl-C.
 enable_on_start  = true
 safe_stop_on_exit = true
+
+# ---- board 0 ------------------------------------------------------------
+
+[[boards]]
+serial = "/dev/ttyACM1"
+name   = "main"
 
 # ---- axes (sticks) -------------------------------------------------------
 # `target`      stepper axis: x | y | z | e | none
@@ -29,21 +39,21 @@ safe_stop_on_exit = true
 # `deadzone`    0..0.95 fraction of stick travel treated as zero.
 # `invert`      flips direction.
 
-[[axes]]
+[[boards.axes]]
 index       = 0
 target      = "x"
 sensitivity = 2000
 deadzone    = 0.10
 invert      = false
 
-[[axes]]
+[[boards.axes]]
 index       = 3
 target      = "y"
 sensitivity = 2000
 deadzone    = 0.10
 invert      = true
 
-[[axes]]
+[[boards.axes]]
 index       = 1
 target      = "z"
 sensitivity = 800
@@ -53,14 +63,35 @@ invert      = false
 # ---- buttons (one-shot nudges) ------------------------------------------
 # `delta` is signed steps; `hz` is the step rate used during the nudge.
 
-[[buttons]]
+[[boards.buttons]]
 index  = 0
 target = "e"
 delta  = 200
 hz     = 1000
 
-[[buttons]]
+[[boards.buttons]]
 index  = 1
 target = "e"
 delta  = -200
 hz     = 1000
+
+# ---- board 1 (example: a second SKR Pico driven by the right stick) -----
+# Uncomment and adjust the serial path to enable.
+#
+# [[boards]]
+# serial = "/dev/ttyACM2"
+# name   = "aux"
+#
+# [[boards.axes]]
+# index       = 2
+# target      = "x"
+# sensitivity = 1500
+# deadzone    = 0.10
+# invert      = false
+#
+# [[boards.axes]]
+# index       = 4
+# target      = "y"
+# sensitivity = 1500
+# deadzone    = 0.10
+# invert      = false
