@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
 // --------------------------------------------------------------------------
@@ -122,15 +122,83 @@ struct Snapshot {
 }
 
 // --------------------------------------------------------------------------
-// Serial writer thread: owns the port, consumes a channel of command strings.
+// Serial setup: open port, version-handshake the firmware, then spawn one
+// writer thread and one drainer thread.
+//
+// The drainer is critical: the firmware echoes each character and emits
+// "ok jog X N" + a prompt for every command. With ~40 commands/sec on a
+// single axis we just barely keep up with the ttyACM read buffer; at
+// ~80/sec (two axes simultaneously) the buffer fills, the kernel stops
+// ACKing the device's IN endpoint, and the firmware blocks inside
+// `write_packet`. That blocks the firmware's CLI task entirely, so new
+// commands stop being processed until the host is restarted (which
+// reopens the port and clears the buffer). Reading and discarding bytes
+// at any rate prevents that backpressure.
 // --------------------------------------------------------------------------
 
-fn spawn_serial(path: String) -> Result<Sender<String>> {
-    let mut port = serialport::new(&path, 115_200)
+const HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn open_port(path: &str) -> Result<Box<dyn serialport::SerialPort>> {
+    serialport::new(path, 115_200)
         .timeout(Duration::from_millis(200))
         .open()
-        .with_context(|| format!("opening serial port {path}"))?;
+        .with_context(|| format!("opening serial port {path}"))
+}
+
+/// Send `version` to the firmware, wait briefly, and return the parsed
+/// `X.Y.Z` it printed. Falls back to the connection banner if the
+/// firmware predates the `version` command.
+fn handshake_version(port: &mut Box<dyn serialport::SerialPort>) -> Result<String> {
+    let _ = port.clear(serialport::ClearBuffer::Input);
+    // Stray newline first so we're not stuck inside a partial line, then
+    // the actual query. The firmware will echo both lines back.
+    port.write_all(b"\r\nversion\r\n")
+        .context("writing version handshake")?;
+    port.flush().ok();
+
+    let mut accum: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 256];
+    let deadline = Instant::now() + Duration::from_millis(800);
+    while Instant::now() < deadline {
+        match port.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                accum.extend_from_slice(&buf[..n]);
+                if accum.len() > 4096 {
+                    break;
+                }
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(e) => return Err(anyhow!("reading version: {e}")),
+        }
+    }
+    let text = String::from_utf8_lossy(&accum);
+    parse_version(&text).ok_or_else(|| {
+        anyhow!(
+            "firmware did not return a parseable version (got: {:?})",
+            text.chars().take(160).collect::<String>()
+        )
+    })
+}
+
+/// Look for the first `vX.Y.Z` token in a buffer.
+fn parse_version(s: &str) -> Option<String> {
+    for tok in s.split(|c: char| !c.is_ascii_alphanumeric() && c != '.') {
+        let Some(rest) = tok.strip_prefix('v') else { continue };
+        let parts: Vec<&str> = rest.split('.').collect();
+        if parts.len() == 3
+            && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+        {
+            return Some(rest.to_string());
+        }
+    }
+    None
+}
+
+fn spawn_serial_threads(mut port: Box<dyn serialport::SerialPort>) -> Result<Sender<String>> {
+    let mut reader = port.try_clone().context("cloning serial port for drainer")?;
     let (tx, rx) = channel::<String>();
+
     thread::Builder::new()
         .name("serial-writer".into())
         .spawn(move || {
@@ -139,6 +207,22 @@ fn spawn_serial(path: String) -> Result<Sender<String>> {
                 let _ = port.flush();
             }
         })?;
+
+    thread::Builder::new()
+        .name("serial-drainer".into())
+        .spawn(move || {
+            let mut buf = [0u8; 512];
+            loop {
+                match reader.read(&mut buf) {
+                    // Discard - firmware's CLI is chatty and we don't act on
+                    // its output. Just keep the buffer empty.
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {}
+                    Err(_) => thread::sleep(Duration::from_millis(50)),
+                }
+            }
+        })?;
+
     Ok(tx)
 }
 
@@ -355,11 +439,25 @@ fn main() -> Result<()> {
     let path = std::env::args().nth(1).unwrap_or_else(|| "config.toml".into());
     let cfg = Arc::new(load_config(&path)?);
 
-    let tx = spawn_serial(cfg.serial.clone())?;
+    // Open the port, do the version handshake before anything else, then
+    // hand the port off to the writer + drainer threads.
+    let mut port = open_port(&cfg.serial)?;
+    // Give the firmware a moment to enumerate / settle on a fresh connect
+    // (the banner takes a few hundred ms to flush after we open).
+    thread::sleep(Duration::from_millis(300));
 
-    // Give the firmware a moment to settle on a fresh connection.
-    thread::sleep(Duration::from_millis(200));
-    send(&tx, "\r\n", cfg.log);
+    let fw_version = handshake_version(&mut port)?;
+    eprintln!("firmware v{fw_version}, host v{HOST_VERSION}");
+    if fw_version != HOST_VERSION {
+        bail!(
+            "version mismatch: firmware v{fw_version} != host v{HOST_VERSION}. \
+             Reflash firmware/target/thumbv6m-none-eabi/release/tmc-new-era.uf2 \
+             or rebuild the host."
+        );
+    }
+
+    let tx = spawn_serial_threads(port)?;
+
     if cfg.enable_on_start {
         send(&tx, "enable all\r\n", cfg.log);
     }
