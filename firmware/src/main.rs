@@ -28,7 +28,7 @@ use embassy_rp::peripherals::USB;
 use embassy_rp::usb::{Driver, InterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Timer};
+use embassy_time::{Duration, Instant, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config, UsbDevice};
@@ -62,6 +62,13 @@ enum AxisCmd {
 const AXES: usize = 4;
 const AXIS_NAMES: [&str; AXES] = ["X", "Y", "Z", "E"];
 const MAX_HZ: u32 = 40_000;
+const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Deadman timeout. If an axis has nonzero velocity and no jog command
+/// arrives within this window, motion halts automatically. The host's
+/// joystick driver resends the current velocity every ~25 ms (40 Hz), so
+/// a single dropped packet or a stalled host thread can't run the arm.
+const WATCHDOG_MS: u64 = 200;
 
 type AxisSignal = Signal<CriticalSectionRawMutex, AxisCmd>;
 
@@ -119,12 +126,15 @@ async fn axis_task(
     let sig = &AXIS_CMD[idx];
     let mut enabled = false;
     let mut velocity: i32 = 0;
+    let mut last_cmd_at = Instant::now();
 
     let apply = |cmd: AxisCmd,
                  enabled: &mut bool,
                  velocity: &mut i32,
+                 last_cmd_at: &mut Instant,
                  dir: &mut Output<'static>,
                  en: &mut Output<'static>| {
+        *last_cmd_at = Instant::now();
         match cmd {
             AxisCmd::Enable(on) => {
                 *enabled = on;
@@ -155,7 +165,7 @@ async fn axis_task(
     loop {
         if velocity == 0 {
             let cmd = sig.wait().await;
-            apply(cmd, &mut enabled, &mut velocity, &mut dir, &mut en);
+            apply(cmd, &mut enabled, &mut velocity, &mut last_cmd_at, &mut dir, &mut en);
             continue;
         }
 
@@ -168,9 +178,19 @@ async fn axis_task(
         let remaining = period_us.saturating_sub(2).max(2);
 
         match select(Timer::after(Duration::from_micros(remaining)), sig.wait()).await {
-            Either::First(_) => {}
+            Either::First(_) => {
+                // Deadman check: if the host has gone silent we halt motion.
+                // Leave EN as-is so we still hold position rather than
+                // collapsing under gravity.
+                if Instant::now().duration_since(last_cmd_at)
+                    > Duration::from_millis(WATCHDOG_MS)
+                {
+                    velocity = 0;
+                    SHADOW[idx].velocity.store(0, Ordering::Relaxed);
+                }
+            }
             Either::Second(cmd) => {
-                apply(cmd, &mut enabled, &mut velocity, &mut dir, &mut en);
+                apply(cmd, &mut enabled, &mut velocity, &mut last_cmd_at, &mut dir, &mut en);
             }
         }
     }
@@ -217,12 +237,18 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
         "help" | "?" => {
             writeln(class, "commands:").await?;
             writeln(class, "  help").await?;
+            writeln(class, "  version").await?;
             writeln(class, "  status").await?;
             writeln(class, "  enable  <x|y|z|e|all>").await?;
             writeln(class, "  disable <x|y|z|e|all>").await?;
             writeln(class, "  jog     <axis> <signed_hz>     0 stops; sign sets DIR").await?;
             writeln(class, "  move    <axis> <steps> [hz]    one-shot, duration-based").await?;
             writeln(class, "max hz 40000.").await?;
+        }
+        "version" | "ver" => {
+            let mut buf: String<64> = String::new();
+            let _ = write!(buf, "tmc-new-era firmware v{FW_VERSION}\r\n");
+            write_all(class, buf.as_bytes()).await?;
         }
         "status" => {
             let mut buf: String<160> = String::new();
@@ -319,7 +345,9 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
 
 async fn cli_session(class: &mut Class) -> Result<(), Disconnected> {
     writeln(class, "").await?;
-    writeln(class, "tmc-new-era - SKR Pico stepper CLI").await?;
+    let mut banner: String<80> = String::new();
+    let _ = write!(banner, "tmc-new-era v{FW_VERSION} - SKR Pico stepper CLI");
+    writeln(class, banner.as_str()).await?;
     writeln(class, "type 'help' for commands").await?;
     prompt(class).await?;
 

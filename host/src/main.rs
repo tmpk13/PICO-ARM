@@ -12,8 +12,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Sender, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -163,22 +162,67 @@ fn axis_token(s: &str) -> Option<&'static str> {
 // fires button-press callbacks for state transitions.
 // --------------------------------------------------------------------------
 
-fn open_joystick(path: &str) -> Result<File> {
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc_o_nonblock())
-        .open(path)
-        .with_context(|| format!("opening joystick {path}"))?;
-    Ok(f)
+fn open_joystick(path: &str) -> std::io::Result<File> {
+    // Blocking reads. When the device is unplugged the read returns either
+    // EOF (Ok(0)) or an error - both let us break out cleanly. With
+    // O_NONBLOCK a disconnected device looks identical to an idle one
+    // (perpetual EWOULDBLOCK), which is exactly how the original v1
+    // missed disconnects.
+    std::fs::OpenOptions::new().read(true).open(path)
 }
 
-// We avoid pulling in `libc` just for one constant.
-const fn libc_o_nonblock() -> i32 { 0o4000 }
-
-fn reader_loop(
-    mut fd: File,
+/// Reader supervisor: keeps trying to open the device, runs an inner read
+/// loop, and on disconnect zeros the snapshot so the integrator immediately
+/// commands `jog 0` instead of latching the stick's last deflected value.
+fn reader_supervisor(
+    device: String,
     snapshot: Arc<Mutex<Snapshot>>,
     on_button_press: impl Fn(u8),
+    connected: Arc<AtomicBool>,
+) {
+    let mut warned = false;
+    loop {
+        match open_joystick(&device) {
+            Ok(mut fd) => {
+                eprintln!("joystick: connected {device}");
+                {
+                    let mut s = snapshot.lock().unwrap();
+                    for v in s.axes.iter_mut() {
+                        *v = 0;
+                    }
+                }
+                connected.store(true, Ordering::SeqCst);
+                run_reader(&mut fd, &snapshot, &on_button_press);
+                connected.store(false, Ordering::SeqCst);
+                {
+                    let mut s = snapshot.lock().unwrap();
+                    for v in s.axes.iter_mut() {
+                        *v = 0;
+                    }
+                }
+                eprintln!("joystick: disconnected, will retry");
+                warned = false;
+                // Brief settle before re-open so we don't pin a CPU when
+                // the device file is briefly present-but-busy during the
+                // kernel's hotplug dance.
+                thread::sleep(Duration::from_millis(300));
+            }
+            Err(e) => {
+                if !warned {
+                    eprintln!("joystick: cannot open {device} ({e}); retrying");
+                    warned = true;
+                }
+                thread::sleep(Duration::from_secs(1));
+            }
+        }
+    }
+}
+
+/// Inner reader. Returns when the device disconnects (read error or EOF).
+fn run_reader(
+    fd: &mut File,
+    snapshot: &Arc<Mutex<Snapshot>>,
+    on_button_press: &impl Fn(u8),
 ) {
     let mut buttons: HashMap<u8, i16> = HashMap::new();
     let mut buf = [0u8; JS_EVENT_SIZE];
@@ -201,38 +245,36 @@ fn reader_loop(
                     }
                 }
             }
-            Ok(_) => {
-                // Short read - shouldn't happen on a joystick fd, just retry.
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(5));
-            }
+            // Short read (n < event size) or EOF: device is gone.
+            Ok(_) => return,
             Err(e) => {
                 eprintln!("joystick read error: {e}");
-                thread::sleep(Duration::from_millis(500));
+                return;
             }
         }
-        // Cheap check that the fd is still alive via poll() would be nice,
-        // but for v1 we rely on the read error path above.
-        let _ = fd.as_raw_fd();
     }
 }
 
 // --------------------------------------------------------------------------
 // Integrator: at poll_hz, computes each mapped axis's signed velocity and
-// emits a `jog` command iff it changed. Mirrors the reference's bucketed
-// chatter suppression.
+// streams jog commands.
+//
+// We *don't* dedup nonzero values - we resend them every tick so the
+// firmware's deadman watchdog stays fed. A single dropped packet (or a
+// stalled thread on either side) therefore halts motion at the watchdog
+// timeout instead of letting the arm coast. Zero is sent once on the
+// transition; the firmware doesn't need a heartbeat to stay stopped.
 // --------------------------------------------------------------------------
 
 fn integrate_loop(
     cfg: &Config,
     snapshot: Arc<Mutex<Snapshot>>,
+    connected: Arc<AtomicBool>,
     tx: Sender<String>,
 ) {
     let period = Duration::from_secs_f32(1.0 / cfg.poll_hz.clamp(10, 200) as f32);
-    // Map: stepper axis token -> (sign, magnitude) last sent. Lets us
-    // suppress duplicate commands when the user holds the stick still.
+    // Last (sign, magnitude) sent per target. Only consulted to detect the
+    // moving -> stopped transition so we don't spam zeros.
     let mut last: HashMap<&'static str, (i32, u32)> = HashMap::new();
     let mut next_tick = Instant::now();
 
@@ -242,11 +284,14 @@ fn integrate_loop(
         if next_tick > now {
             thread::sleep(next_tick - now);
         } else {
-            // Fell behind; resync.
             next_tick = Instant::now() + period;
         }
 
-        let axes_state = snapshot.lock().unwrap().axes.clone();
+        let axes_state = if connected.load(Ordering::SeqCst) {
+            snapshot.lock().unwrap().axes.clone()
+        } else {
+            Vec::new()
+        };
 
         for map in &cfg.axes {
             let Some(target) = axis_token(&map.target) else { continue };
@@ -264,10 +309,8 @@ fn integrate_loop(
                 norm * map.sensitivity
             };
 
-            // Bucket to nearest 25 steps/s so a noisy stick doesn't spam.
             let (new_sign, new_mag): (i32, u32) = if signed_v.abs() < 1.0 {
-                let prev = last.get(&target).copied().unwrap_or((0, 0));
-                (prev.0, 0)
+                (0, 0)
             } else {
                 let s = if signed_v > 0.0 { 1 } else { -1 };
                 let m = ((signed_v.abs() / 25.0).round() as u32).max(1) * 25;
@@ -275,20 +318,12 @@ fn integrate_loop(
             };
 
             let prev = last.get(&target).copied().unwrap_or((0, 0));
-            if (new_sign, new_mag) == prev {
-                continue;
-            }
-            // Skip an idle-to-idle nothing.
+            // Idle -> idle: nothing to send.
             if new_mag == 0 && prev.1 == 0 {
-                last.insert(target, (new_sign, new_mag));
                 continue;
             }
             last.insert(target, (new_sign, new_mag));
-            let signed_hz: i32 = if new_mag == 0 {
-                0
-            } else {
-                new_sign * new_mag as i32
-            };
+            let signed_hz: i32 = new_sign * new_mag as i32;
             send(&tx, &format!("jog {target} {signed_hz}\r\n"), cfg.log);
         }
     }
@@ -330,30 +365,37 @@ fn main() -> Result<()> {
     }
 
     let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+    let connected = Arc::new(AtomicBool::new(false));
 
-    // Joystick reader thread.
-    let fd = open_joystick(&cfg.device)
-        .with_context(|| format!("opening joystick {}", cfg.device))?;
+    // Joystick reader thread - supervises (re)open / read / disconnect.
     let snap_for_reader = snapshot.clone();
     let buttons = cfg.buttons.clone();
     let tx_for_buttons = tx.clone();
     let log_buttons = cfg.log;
+    let device = cfg.device.clone();
+    let connected_for_reader = connected.clone();
     thread::Builder::new().name("js-reader".into()).spawn(move || {
-        reader_loop(fd, snap_for_reader, move |btn| {
-            if let Some(b) = buttons.iter().find(|b| b.index as u8 == btn) {
-                if let Some(target) = axis_token(&b.target) {
-                    let cmd = format!("move {target} {} {}\r\n", b.delta, b.hz);
-                    send(&tx_for_buttons, &cmd, log_buttons);
+        reader_supervisor(
+            device,
+            snap_for_reader,
+            move |btn| {
+                if let Some(b) = buttons.iter().find(|b| b.index as u8 == btn) {
+                    if let Some(target) = axis_token(&b.target) {
+                        let cmd = format!("move {target} {} {}\r\n", b.delta, b.hz);
+                        send(&tx_for_buttons, &cmd, log_buttons);
+                    }
                 }
-            }
-        });
+            },
+            connected_for_reader,
+        );
     })?;
 
     // Integrator thread.
     let cfg_for_int = cfg.clone();
     let tx_for_int = tx.clone();
+    let connected_for_int = connected.clone();
     thread::Builder::new().name("integrator".into()).spawn(move || {
-        integrate_loop(&cfg_for_int, snapshot, tx_for_int);
+        integrate_loop(&cfg_for_int, snapshot, connected_for_int, tx_for_int);
     })?;
 
     eprintln!(
@@ -383,11 +425,10 @@ fn main() -> Result<()> {
 // Minimal SIGINT trap (no ctrlc / signal-hook dep).
 // --------------------------------------------------------------------------
 
-use std::sync::atomic::AtomicBool;
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_sigint(_: i32) {
-    STOP.store(true, std::sync::atomic::Ordering::SeqCst);
+    STOP.store(true, Ordering::SeqCst);
 }
 
 fn install_sigint() {
