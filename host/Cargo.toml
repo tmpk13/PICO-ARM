@@ -1,0 +1,15 @@
+[package]
+name = "tmc-new-era-host"
+version = "0.1.0"
+edition = "2024"
+description = "Host-side joystick driver for the SKR Pico firmware: reads /dev/input/jsN and a TOML mapping, sends jog/move commands over USB CDC serial."
+
+[[bin]]
+name = "tmc-new-era-host"
+path = "src/main.rs"
+
+[dependencies]
+serialport = "4.7"
+serde      = { version = "1", features = ["derive"] }
+toml       = "0.8"
+anyhow     = "1"
