@@ -65,6 +65,8 @@ struct BoardConfig {
     axes: Vec<AxisMap>,
     #[serde(default)]
     buttons: Vec<ButtonMap>,
+    #[serde(default)]
+    fans: Vec<FanMap>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -97,6 +99,19 @@ struct ButtonMap {
 }
 
 fn default_button_hz() -> u32 { 1000 }
+
+#[derive(Debug, Deserialize, Clone)]
+struct FanMap {
+    /// Joystick button index that drives this fan.
+    index: usize,
+    /// Firmware fan number (0..=2 -> GP17/GP18/GP20).
+    target: usize,
+    /// "toggle" (press flips state) or "momentary" (on while held).
+    #[serde(default = "default_fan_mode")]
+    mode: String,
+}
+
+fn default_fan_mode() -> String { "toggle".into() }
 
 // --------------------------------------------------------------------------
 // Linux joystick event format (linux/joystick.h)
@@ -289,7 +304,7 @@ fn open_joystick(path: &str) -> std::io::Result<File> {
 fn reader_supervisor(
     device: String,
     snapshot: Arc<Mutex<Snapshot>>,
-    on_button_press: impl Fn(u8),
+    mut on_button_change: impl FnMut(u8, bool),
     connected: Arc<AtomicBool>,
 ) {
     let mut warned = false;
@@ -304,7 +319,7 @@ fn reader_supervisor(
                     }
                 }
                 connected.store(true, Ordering::SeqCst);
-                run_reader(&mut fd, &snapshot, &on_button_press);
+                run_reader(&mut fd, &snapshot, &mut on_button_change);
                 connected.store(false, Ordering::SeqCst);
                 {
                     let mut s = snapshot.lock().unwrap();
@@ -331,10 +346,14 @@ fn reader_supervisor(
 }
 
 /// Inner reader. Returns when the device disconnects (read error or EOF).
+/// Fires `on_button_change(idx, pressed)` on both edges so that momentary
+/// fan bindings can react to release. Init events (the `0x80` mask kernel
+/// sends on open) are dropped so plugging the controller in doesn't toggle
+/// every button.
 fn run_reader(
     fd: &mut File,
     snapshot: &Arc<Mutex<Snapshot>>,
-    on_button_press: &impl Fn(u8),
+    on_button_change: &mut impl FnMut(u8, bool),
 ) {
     let mut buttons: HashMap<u8, i16> = HashMap::new();
     let mut buf = [0u8; JS_EVENT_SIZE];
@@ -352,8 +371,12 @@ fn run_reader(
                     s.axes[ev.number as usize] = ev.value;
                 } else if kind == JS_EVENT_BUTTON {
                     let prev = buttons.insert(ev.number, ev.value).unwrap_or(0);
-                    if ev.value != 0 && prev == 0 && !is_init {
-                        on_button_press(ev.number);
+                    if !is_init {
+                        if ev.value != 0 && prev == 0 {
+                            on_button_change(ev.number, true);
+                        } else if ev.value == 0 && prev != 0 {
+                            on_button_change(ev.number, false);
+                        }
                     }
                 }
             }
@@ -527,16 +550,51 @@ fn main() -> Result<()> {
         .zip(links.iter().cloned())
         .map(|(b, link)| (link, b.buttons.clone()))
         .collect();
+    let boards_for_fans: Vec<(BoardLink, Vec<FanMap>)> = cfg.boards.iter()
+        .zip(links.iter().cloned())
+        .map(|(b, link)| (link, b.fans.clone()))
+        .collect();
+    // Toggle state lives in the reader thread (the only writer) keyed by
+    // (board_idx, fan_target). Default-false; we don't query the firmware
+    // because boot already leaves fans off and the integrator never touches
+    // them.
+    let mut fan_state: HashMap<(usize, usize), bool> = HashMap::new();
     thread::Builder::new().name("js-reader".into()).spawn(move || {
         reader_supervisor(
             device,
             snap_for_reader,
-            move |btn| {
-                for (link, buttons) in &boards_for_buttons {
-                    for b in buttons.iter().filter(|b| b.index as u8 == btn) {
-                        if let Some(target) = axis_token(&b.target) {
-                            let cmd = format!("move {target} {} {}\r\n", b.delta, b.hz);
-                            send(link, &cmd, log_buttons);
+            move |btn, pressed| {
+                if pressed {
+                    for (link, buttons) in &boards_for_buttons {
+                        for b in buttons.iter().filter(|b| b.index as u8 == btn) {
+                            if let Some(target) = axis_token(&b.target) {
+                                let cmd = format!("move {target} {} {}\r\n", b.delta, b.hz);
+                                send(link, &cmd, log_buttons);
+                            }
+                        }
+                    }
+                }
+                for (board_idx, (link, fans)) in boards_for_fans.iter().enumerate() {
+                    for f in fans.iter().filter(|f| f.index as u8 == btn) {
+                        let key = (board_idx, f.target);
+                        match f.mode.as_str() {
+                            "momentary" => {
+                                let on = pressed;
+                                fan_state.insert(key, on);
+                                let cmd = format!("fan {} {}\r\n",
+                                    f.target, if on { "on" } else { "off" });
+                                send(link, &cmd, log_buttons);
+                            }
+                            // default: toggle (only act on press edge)
+                            _ => {
+                                if pressed {
+                                    let new_state = !fan_state.get(&key).copied().unwrap_or(false);
+                                    fan_state.insert(key, new_state);
+                                    let cmd = format!("fan {} {}\r\n",
+                                        f.target, if new_state { "on" } else { "off" });
+                                    send(link, &cmd, log_buttons);
+                                }
+                            }
                         }
                     }
                 }
@@ -566,9 +624,13 @@ fn main() -> Result<()> {
     loop {
         if STOP.load(std::sync::atomic::Ordering::SeqCst) {
             if cfg.safe_stop_on_exit {
-                for link in &links {
+                for (board_idx, board) in cfg.boards.iter().enumerate() {
+                    let link = &links[board_idx];
                     for a in ["x", "y", "z", "e"] {
                         send(link, &format!("jog {a} 0\r\n"), cfg.log);
+                    }
+                    for f in &board.fans {
+                        send(link, &format!("fan {} off\r\n", f.target), cfg.log);
                     }
                     send(link, "disable all\r\n", cfg.log);
                 }

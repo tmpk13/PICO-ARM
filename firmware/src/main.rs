@@ -61,6 +61,7 @@ enum AxisCmd {
 
 const AXES: usize = 4;
 const AXIS_NAMES: [&str; AXES] = ["X", "Y", "Z", "E"];
+const FANS: usize = 3;
 const MAX_HZ: u32 = 40_000;
 const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -110,6 +111,45 @@ fn send_cmd(idx: usize, cmd: AxisCmd) {
         AxisCmd::Jog(hz) => SHADOW[idx].velocity.store(hz, Ordering::Relaxed),
     }
     AXIS_CMD[idx].signal(cmd);
+}
+
+// --------------------------------------------------------------------------
+// Fans: 3 plain on/off MOSFET outputs on the SKR Pico's fan headers
+// (GP17, GP18, GP20). A small task per fan listens on a Signal so the CLI
+// handler is non-blocking; FAN_STATE mirrors the last commanded value for
+// `status` and so the host can drive the same pin from multiple buttons
+// without round-tripping a query.
+// --------------------------------------------------------------------------
+
+type FanSignal = Signal<CriticalSectionRawMutex, bool>;
+static FAN_CMD: [FanSignal; FANS] = [
+    Signal::new(),
+    Signal::new(),
+    Signal::new(),
+];
+static FAN_STATE: [AtomicBool; FANS] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
+
+fn fan_cmd(idx: usize, on: bool) {
+    FAN_STATE[idx].store(on, Ordering::Relaxed);
+    FAN_CMD[idx].signal(on);
+}
+
+#[embassy_executor::task(pool_size = FANS)]
+async fn fan_task(idx: usize, mut out: Output<'static>) {
+    out.set_low();
+    loop {
+        let on = FAN_CMD[idx].wait().await;
+        if on {
+            out.set_high();
+        } else {
+            out.set_low();
+        }
+        FAN_STATE[idx].store(on, Ordering::Relaxed);
+    }
 }
 
 #[embassy_executor::task(pool_size = AXES)]
@@ -243,6 +283,7 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
             writeln(class, "  disable <x|y|z|e|all>").await?;
             writeln(class, "  jog     <axis> <signed_hz>     0 stops; sign sets DIR").await?;
             writeln(class, "  move    <axis> <steps> [hz]    one-shot, duration-based").await?;
+            writeln(class, "  fan     <0|1|2> <on|off>       SKR Pico fan headers").await?;
             writeln(class, "max hz 40000.").await?;
         }
         "version" | "ver" => {
@@ -251,7 +292,7 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
             write_all(class, buf.as_bytes()).await?;
         }
         "status" => {
-            let mut buf: String<160> = String::new();
+            let mut buf: String<256> = String::new();
             for i in 0..AXES {
                 let _ = write!(
                     buf,
@@ -259,6 +300,14 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
                     AXIS_NAMES[i],
                     if SHADOW[i].enabled.load(Ordering::Relaxed) { "EN" } else { "--" },
                     SHADOW[i].velocity.load(Ordering::Relaxed),
+                );
+            }
+            for i in 0..FANS {
+                let _ = write!(
+                    buf,
+                    "  fan{}: {}\r\n",
+                    i,
+                    if FAN_STATE[i].load(Ordering::Relaxed) { "ON" } else { "off" },
                 );
             }
             write_all(class, buf.as_bytes()).await?;
@@ -335,6 +384,32 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
             Timer::after(Duration::from_micros(duration_us)).await;
             send_cmd(idx, AxisCmd::Jog(0));
             writeln(class, "done").await?;
+        }
+        "fan" => {
+            let (Some(idx_s), Some(state_s)) = (it.next(), it.next()) else {
+                writeln(class, "usage: fan <0|1|2> <on|off>").await?;
+                return Ok(());
+            };
+            let Ok(idx) = idx_s.parse::<usize>() else {
+                writeln(class, "bad fan number").await?;
+                return Ok(());
+            };
+            if idx >= FANS {
+                writeln(class, "fan out of range").await?;
+                return Ok(());
+            }
+            let on = match state_s {
+                "on" | "1" | "ON" => true,
+                "off" | "0" | "OFF" => false,
+                _ => {
+                    writeln(class, "bad fan state (on|off)").await?;
+                    return Ok(());
+                }
+            };
+            fan_cmd(idx, on);
+            let mut buf: String<48> = String::new();
+            let _ = write!(buf, "ok fan {} {}\r\n", idx, if on { "on" } else { "off" });
+            write_all(class, buf.as_bytes()).await?;
         }
         _ => {
             writeln(class, "unknown command - try 'help'").await?;
@@ -433,6 +508,20 @@ async fn main(spawner: Spawner) {
         .expect("axis task pool full"),
     );
 
+    // Fan headers on the SKR Pico: GP17, GP18, GP20. Plain on/off.
+    spawner.spawn(
+        fan_task(0, Output::new(p.PIN_17, Level::Low))
+            .expect("fan task pool full"),
+    );
+    spawner.spawn(
+        fan_task(1, Output::new(p.PIN_18, Level::Low))
+            .expect("fan task pool full"),
+    );
+    spawner.spawn(
+        fan_task(2, Output::new(p.PIN_20, Level::Low))
+            .expect("fan task pool full"),
+    );
+
     let driver = Driver::new(p.USB, Irqs);
 
     let mut usb_cfg = Config::new(0x16c0, 0x27dd);
@@ -465,10 +554,14 @@ async fn main(spawner: Spawner) {
         class.wait_connection().await;
         let _ = cli_session(&mut class).await;
         // Disconnect: halt and de-energize so a yanked cable doesn't leave
-        // a coil powered indefinitely.
+        // a coil powered indefinitely. Fans go off too - a stuck-on fan
+        // after the host vanished is a footgun.
         for i in 0..AXES {
             send_cmd(i, AxisCmd::Jog(0));
             send_cmd(i, AxisCmd::Enable(false));
+        }
+        for i in 0..FANS {
+            fan_cmd(i, false);
         }
     }
 }

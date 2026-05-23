@@ -82,6 +82,27 @@ invert      = false
 # delta  = -200
 # hz     = 1000
 
+# ---- fans ---------------------------------------------------------------
+# `index`  joystick button index
+# `target` firmware fan number: 0 = GP17, 1 = GP18, 2 = GP20
+# `mode`   "toggle"   - each press flips the fan on/off
+#          "momentary" - on while the button is held, off on release
+
+[[boards.fans]]
+index  = 4
+target = 0
+mode   = "toggle"
+
+[[boards.fans]]
+index  = 5
+target = 1
+mode   = "momentary"
+
+# [[boards.fans]]
+# index  = 6
+# target = 2
+# mode   = "toggle"
+
 # ---- board 1 (example: a second SKR Pico driven by the right stick) -----
 # Uncomment and adjust the serial path to enable.
 #
