@@ -1,0 +1,66 @@
+# tmc-new-era host config.
+#
+# Each [[axes]] block maps one joystick axis (index N on /dev/input/jsN) to
+# one stepper axis on the SKR Pico. At full deflection the firmware will be
+# commanded `jog <target> <+- sensitivity>` (in steps/sec). Inside the
+# deadzone the axis is treated as zero (and the firmware is told to stop).
+#
+# Each [[buttons]] block sends a single one-shot `move` on press.
+
+# Path to the firmware's USB CDC serial port.
+serial  = "/dev/ttyACM1"
+
+# Linux joystick device. Use `ls /dev/input/js*` to find yours.
+device  = "/dev/input/js0"
+
+# Integrator tick rate. The reference uses 40 Hz; valid range 10..200.
+poll_hz = 40
+
+# Print every command sent to the firmware. Handy when first wiring up.
+log = true
+
+# Send `enable all` once on startup, and `disable all` on Ctrl-C.
+enable_on_start  = true
+safe_stop_on_exit = true
+
+# ---- axes (sticks) -------------------------------------------------------
+# `target`      stepper axis: x | y | z | e | none
+# `sensitivity` steps/sec at full deflection. Try 500-2000 to start.
+# `deadzone`    0..0.95 fraction of stick travel treated as zero.
+# `invert`      flips direction.
+
+[[axes]]
+index       = 0
+target      = "x"
+sensitivity = 2000
+deadzone    = 0.10
+invert      = false
+
+[[axes]]
+index       = 3
+target      = "y"
+sensitivity = 2000
+deadzone    = 0.10
+invert      = true
+
+[[axes]]
+index       = 1
+target      = "z"
+sensitivity = 800
+deadzone    = 0.15
+invert      = false
+
+# ---- buttons (one-shot nudges) ------------------------------------------
+# `delta` is signed steps; `hz` is the step rate used during the nudge.
+
+[[buttons]]
+index  = 0
+target = "e"
+delta  = 200
+hz     = 1000
+
+[[buttons]]
+index  = 1
+target = "e"
+delta  = -200
+hz     = 1000
