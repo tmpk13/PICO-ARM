@@ -40,7 +40,7 @@ name   = "main"
 # `invert`      flips direction.
 
 [[boards.axes]]
-index       = 0
+index       = 1
 target      = "x"
 sensitivity = 2000
 deadzone    = 0.10
@@ -54,7 +54,14 @@ deadzone    = 0.10
 invert      = true
 
 [[boards.axes]]
-index       = 1
+index       = 0
+target      = "e"
+sensitivity = 800
+deadzone    = 0.15
+invert      = false
+
+[[boards.axes]]
+index       = 5
 target      = "z"
 sensitivity = 800
 deadzone    = 0.15
@@ -63,17 +70,17 @@ invert      = false
 # ---- buttons (one-shot nudges) ------------------------------------------
 # `delta` is signed steps; `hz` is the step rate used during the nudge.
 
-[[boards.buttons]]
-index  = 0
-target = "e"
-delta  = 200
-hz     = 1000
+# [[boards.buttons]]
+# index  = 0
+# target = "e"
+# delta  = 200
+# hz     = 1000
 
-[[boards.buttons]]
-index  = 1
-target = "e"
-delta  = -200
-hz     = 1000
+# [[boards.buttons]]
+# index  = 1
+# target = "e"
+# delta  = -200
+# hz     = 1000
 
 # ---- board 1 (example: a second SKR Pico driven by the right stick) -----
 # Uncomment and adjust the serial path to enable.
