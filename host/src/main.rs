@@ -67,6 +67,14 @@ struct BoardConfig {
     buttons: Vec<ButtonMap>,
     #[serde(default)]
     fans: Vec<FanMap>,
+    /// Stick-driven servos: stick position is mapped linearly to a pulse
+    /// width between `min_us` and `max_us`.
+    #[serde(default)]
+    servo_axes: Vec<ServoAxisMap>,
+    /// Button-driven servos: each press jumps to `press_us`; release goes
+    /// to `release_us` (momentary) or holds (toggle).
+    #[serde(default)]
+    servo_buttons: Vec<ServoButtonMap>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -112,6 +120,55 @@ struct FanMap {
 }
 
 fn default_fan_mode() -> String { "toggle".into() }
+
+#[derive(Debug, Deserialize, Clone)]
+struct ServoAxisMap {
+    /// Joystick axis index (`/dev/input/js0` numbering).
+    index: usize,
+    /// Firmware servo number 0..=4 (0..3 = X/Y/Z/E0 endstop headers,
+    /// 4 = dedicated SERVOS header on GP29).
+    target: usize,
+    /// Pulse width at full negative deflection (us).
+    #[serde(default = "default_servo_min_us")]
+    min_us: u16,
+    /// Pulse width at full positive deflection (us).
+    #[serde(default = "default_servo_max_us")]
+    max_us: u16,
+    /// Pulse width at stick centre / inside the deadzone. If left at 0
+    /// the servo goes limp inside the deadzone.
+    #[serde(default = "default_servo_center_us")]
+    center_us: u16,
+    /// Fraction (0..0.95) of stick travel treated as centre.
+    #[serde(default)]
+    deadzone: f32,
+    /// Flip the sign of the stick reading.
+    #[serde(default)]
+    invert: bool,
+}
+
+fn default_servo_min_us() -> u16 { 1000 }
+fn default_servo_max_us() -> u16 { 2000 }
+fn default_servo_center_us() -> u16 { 1500 }
+
+#[derive(Debug, Deserialize, Clone)]
+struct ServoButtonMap {
+    /// Joystick button index.
+    index: usize,
+    /// Firmware servo number 0..=4.
+    target: usize,
+    /// Pulse width while button is held (or after toggle-on).
+    press_us: u16,
+    /// Pulse width when button released (or after toggle-off). Set 0 to
+    /// disable the PWM output (servo goes limp).
+    #[serde(default)]
+    release_us: u16,
+    /// "toggle" (press flips between press_us / release_us) or
+    /// "momentary" (press_us while held, release_us on release).
+    #[serde(default = "default_servo_button_mode")]
+    mode: String,
+}
+
+fn default_servo_button_mode() -> String { "momentary".into() }
 
 // --------------------------------------------------------------------------
 // Linux joystick event format (linux/joystick.h)
@@ -413,6 +470,11 @@ fn integrate_loop(
     let period = Duration::from_secs_f32(1.0 / cfg.poll_hz.clamp(10, 200) as f32);
     let mut last: Vec<HashMap<&'static str, (i32, u32)>> =
         (0..cfg.boards.len()).map(|_| HashMap::new()).collect();
+    // Per-board last-sent servo pulse width keyed by target index. Like
+    // `last`, this lets us suppress duplicate sends when the stick is
+    // sitting still inside or outside the deadzone.
+    let mut last_servo: Vec<HashMap<usize, u16>> =
+        (0..cfg.boards.len()).map(|_| HashMap::new()).collect();
     let mut next_tick = Instant::now();
 
     loop {
@@ -464,6 +526,37 @@ fn integrate_loop(
                 last[board_idx].insert(target, (new_sign, new_mag));
                 let signed_hz: i32 = new_sign * new_mag as i32;
                 send(link, &format!("jog {target} {signed_hz}\r\n"), cfg.log);
+            }
+            for map in &board.servo_axes {
+                if map.target > 4 {
+                    continue;
+                }
+                let raw = match axes_state.get(map.index) {
+                    Some(v) => *v as f32 / JS_MAX,
+                    None => 0.0,
+                };
+                let raw = if map.invert { -raw } else { raw };
+                let dz = map.deadzone.clamp(0.0, 0.95);
+                let new_us: u16 = if raw.abs() < dz {
+                    map.center_us
+                } else {
+                    // Map stick travel outside the deadzone into [-1,1],
+                    // then linearly into [min_us, max_us] with 0 at centre.
+                    let norm = ((raw.abs() - dz) / (1.0 - dz)) * raw.signum();
+                    // norm is now in [-1, 1]; map to [min_us, max_us].
+                    let lo = map.min_us as f32;
+                    let hi = map.max_us as f32;
+                    let mid = (lo + hi) * 0.5;
+                    let half = (hi - lo) * 0.5;
+                    let v = mid + norm * half;
+                    v.round().clamp(0.0, 10_000.0) as u16
+                };
+                let prev = last_servo[board_idx].get(&map.target).copied();
+                if prev == Some(new_us) {
+                    continue;
+                }
+                last_servo[board_idx].insert(map.target, new_us);
+                send(link, &format!("servo {} {}\r\n", map.target, new_us), cfg.log);
             }
         }
     }
@@ -554,11 +647,18 @@ fn main() -> Result<()> {
         .zip(links.iter().cloned())
         .map(|(b, link)| (link, b.fans.clone()))
         .collect();
+    let boards_for_servo_buttons: Vec<(BoardLink, Vec<ServoButtonMap>)> = cfg.boards.iter()
+        .zip(links.iter().cloned())
+        .map(|(b, link)| (link, b.servo_buttons.clone()))
+        .collect();
     // Toggle state lives in the reader thread (the only writer) keyed by
     // (board_idx, fan_target). Default-false; we don't query the firmware
     // because boot already leaves fans off and the integrator never touches
     // them.
     let mut fan_state: HashMap<(usize, usize), bool> = HashMap::new();
+    // Same idea for servo-toggle bindings: `true` means the servo is
+    // currently sitting at press_us, `false` at release_us.
+    let mut servo_toggle_state: HashMap<(usize, usize), bool> = HashMap::new();
     thread::Builder::new().name("js-reader".into()).spawn(move || {
         reader_supervisor(
             device,
@@ -598,6 +698,29 @@ fn main() -> Result<()> {
                         }
                     }
                 }
+                for (board_idx, (link, servos)) in boards_for_servo_buttons.iter().enumerate() {
+                    for s in servos.iter().filter(|s| s.index as u8 == btn) {
+                        if s.target > 4 {
+                            continue;
+                        }
+                        let key = (board_idx, s.target);
+                        match s.mode.as_str() {
+                            "toggle" => {
+                                if pressed {
+                                    let new_state = !servo_toggle_state.get(&key).copied().unwrap_or(false);
+                                    servo_toggle_state.insert(key, new_state);
+                                    let us = if new_state { s.press_us } else { s.release_us };
+                                    send(link, &format!("servo {} {us}\r\n", s.target), log_buttons);
+                                }
+                            }
+                            // default: momentary
+                            _ => {
+                                let us = if pressed { s.press_us } else { s.release_us };
+                                send(link, &format!("servo {} {us}\r\n", s.target), log_buttons);
+                            }
+                        }
+                    }
+                }
             },
             connected_for_reader,
         );
@@ -613,9 +736,11 @@ fn main() -> Result<()> {
 
     let total_axes: usize = cfg.boards.iter().map(|b| b.axes.len()).sum();
     let total_buttons: usize = cfg.boards.iter().map(|b| b.buttons.len()).sum();
+    let total_servos: usize = cfg.boards.iter()
+        .map(|b| b.servo_axes.len() + b.servo_buttons.len()).sum();
     eprintln!(
-        "tmc-new-era-host: device={} poll_hz={} boards={} axes={} buttons={}",
-        cfg.device, cfg.poll_hz, cfg.boards.len(), total_axes, total_buttons
+        "tmc-new-era-host: device={} poll_hz={} boards={} axes={} buttons={} servos={}",
+        cfg.device, cfg.poll_hz, cfg.boards.len(), total_axes, total_buttons, total_servos
     );
     eprintln!("Ctrl-C to stop.");
 
@@ -631,6 +756,19 @@ fn main() -> Result<()> {
                     }
                     for f in &board.fans {
                         send(link, &format!("fan {} off\r\n", f.target), cfg.log);
+                    }
+                    // Limp every servo this board has a binding for so the
+                    // joints don't try to hold position against gravity once
+                    // we let go of the joystick.
+                    let mut servoed = std::collections::HashSet::<usize>::new();
+                    for s in &board.servo_axes {
+                        servoed.insert(s.target);
+                    }
+                    for s in &board.servo_buttons {
+                        servoed.insert(s.target);
+                    }
+                    for n in servoed {
+                        send(link, &format!("servo {n} 0\r\n"), cfg.log);
                     }
                     send(link, "disable all\r\n", cfg.log);
                 }

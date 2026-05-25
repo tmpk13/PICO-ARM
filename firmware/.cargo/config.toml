@@ -1,2 +1,13 @@
 [build]
 target = "thumbv6m-none-eabi"
+
+# `cargo run` (and the `ap-run` alias below) builds the elf, then hands it
+# to elf2uf2-rs which converts to UF2 and copies onto the mounted RPI-RP2
+# mass-storage volume. The board must already be in BOOTSEL mode (hold
+# BOOTSEL while plugging in, or while pressing RESET).
+[target.thumbv6m-none-eabi]
+runner = "elf2uf2-rs -d"
+
+[alias]
+# `cargo ap-run` = build release + auto-flash to a BOOTSEL'd Pico.
+ap-run = "run --release"

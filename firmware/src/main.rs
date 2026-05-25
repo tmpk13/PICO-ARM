@@ -8,6 +8,8 @@
 //     jog x -400           # reverse at 400 steps/sec
 //     jog x 0              # stop
 //     move x 1600 1000     # one-shot: ~1600 steps at 1000 hz (duration-based)
+//     fan 0 on             # SKR Pico fan headers
+//     servo 4 1500         # 1500 us pulse on the SERVOS header; 0 = limp
 //     disable all
 //
 // Each axis runs in its own task fed by a Signal, so jog commands take
@@ -18,13 +20,14 @@
 #![no_main]
 
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::USB;
+use embassy_rp::pwm::{Config as PwmConfig, Pwm};
 use embassy_rp::usb::{Driver, InterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::signal::Signal;
@@ -62,6 +65,8 @@ enum AxisCmd {
 const AXES: usize = 4;
 const AXIS_NAMES: [&str; AXES] = ["X", "Y", "Z", "E"];
 const FANS: usize = 3;
+const SERVOS: usize = 5;
+const SERVO_NAMES: [&str; SERVOS] = ["X-STOP", "Y-STOP", "Z-STOP", "E0-STOP", "SERVOS"];
 const MAX_HZ: u32 = 40_000;
 const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -149,6 +154,84 @@ async fn fan_task(idx: usize, mut out: Output<'static>) {
             out.set_low();
         }
         FAN_STATE[idx].store(on, Ordering::Relaxed);
+    }
+}
+
+// --------------------------------------------------------------------------
+// Servos: the four endstop headers (X/Y/Z/E0-STOP) plus the dedicated
+// SERVOS header on GP29. All five sit on different RP2040 PWM slices, so
+// each runs an independent 50 Hz channel with its own pulse width.
+//
+//   index 0 -> X-STOP   GP4   slice 2 chan A
+//   index 1 -> Y-STOP   GP3   slice 1 chan B
+//   index 2 -> Z-STOP   GP25  slice 4 chan B
+//   index 3 -> E0-STOP  GP16  slice 0 chan A
+//   index 4 -> SERVOS   GP29  slice 6 chan B
+//
+// Endstop headers are 3-pin (5V/GND/signal). The 5V pin is shared with the
+// onboard switching reg - fine for small hobby servos, but power large /
+// stalled servos from an external rail with a common ground.
+//
+// Pulse width is the only knob: 0 us disables PWM output (servo goes
+// limp), otherwise typical values are 500..2500 us with 1500 us centre.
+// --------------------------------------------------------------------------
+
+/// 125 MHz sysclk / 64 = 1.953125 MHz tick. top+1 = 39063 -> 49.999 Hz.
+const SERVO_DIVIDER: u8 = 64;
+const SERVO_TOP: u16 = 39_062;
+/// ticks per us = 1_953_125 / 1_000_000.
+fn us_to_compare(us: u16) -> u16 {
+    ((us as u32 * 1_953_125) / 1_000_000) as u16
+}
+
+/// true = pin is on channel A of its slice; false = channel B. Used by
+/// the servo task to update the correct `compare_*` field when a new
+/// pulse width arrives.
+const SERVO_CHAN_A: [bool; SERVOS] = [true, false, false, true, false];
+
+type ServoSignal = Signal<CriticalSectionRawMutex, u16>;
+static SERVO_CMD: [ServoSignal; SERVOS] = [
+    Signal::new(),
+    Signal::new(),
+    Signal::new(),
+    Signal::new(),
+    Signal::new(),
+];
+static SERVO_STATE: [AtomicU16; SERVOS] = [
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+    AtomicU16::new(0),
+];
+
+fn servo_cmd(idx: usize, us: u16) {
+    SERVO_STATE[idx].store(us, Ordering::Relaxed);
+    SERVO_CMD[idx].signal(us);
+}
+
+fn servo_base_config() -> PwmConfig {
+    let mut c = PwmConfig::default();
+    c.divider = SERVO_DIVIDER.into();
+    c.top = SERVO_TOP;
+    c.compare_a = 0;
+    c.compare_b = 0;
+    c
+}
+
+#[embassy_executor::task(pool_size = SERVOS)]
+async fn servo_task(idx: usize, mut pwm: Pwm<'static>) {
+    let mut cfg = servo_base_config();
+    pwm.set_config(&cfg);
+    loop {
+        let us = SERVO_CMD[idx].wait().await;
+        let compare = if us == 0 { 0 } else { us_to_compare(us) };
+        if SERVO_CHAN_A[idx] {
+            cfg.compare_a = compare;
+        } else {
+            cfg.compare_b = compare;
+        }
+        pwm.set_config(&cfg);
     }
 }
 
@@ -284,6 +367,7 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
             writeln(class, "  jog     <axis> <signed_hz>     0 stops; sign sets DIR").await?;
             writeln(class, "  move    <axis> <steps> [hz]    one-shot, duration-based").await?;
             writeln(class, "  fan     <0|1|2> <on|off>       SKR Pico fan headers").await?;
+            writeln(class, "  servo   <0..4> <us>            0=off, 500..2500 typical").await?;
             writeln(class, "max hz 40000.").await?;
         }
         "version" | "ver" => {
@@ -292,7 +376,7 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
             write_all(class, buf.as_bytes()).await?;
         }
         "status" => {
-            let mut buf: String<256> = String::new();
+            let mut buf: String<512> = String::new();
             for i in 0..AXES {
                 let _ = write!(
                     buf,
@@ -309,6 +393,10 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
                     i,
                     if FAN_STATE[i].load(Ordering::Relaxed) { "ON" } else { "off" },
                 );
+            }
+            for i in 0..SERVOS {
+                let us = SERVO_STATE[i].load(Ordering::Relaxed);
+                let _ = write!(buf, "  servo{} ({}): {} us\r\n", i, SERVO_NAMES[i], us);
             }
             write_all(class, buf.as_bytes()).await?;
         }
@@ -409,6 +497,36 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
             fan_cmd(idx, on);
             let mut buf: String<48> = String::new();
             let _ = write!(buf, "ok fan {} {}\r\n", idx, if on { "on" } else { "off" });
+            write_all(class, buf.as_bytes()).await?;
+        }
+        "servo" => {
+            let (Some(idx_s), Some(us_s)) = (it.next(), it.next()) else {
+                writeln(class, "usage: servo <0..4> <us|off>").await?;
+                return Ok(());
+            };
+            let Ok(idx) = idx_s.parse::<usize>() else {
+                writeln(class, "bad servo number").await?;
+                return Ok(());
+            };
+            if idx >= SERVOS {
+                writeln(class, "servo out of range (0..4)").await?;
+                return Ok(());
+            }
+            let us: u16 = match us_s {
+                "off" | "OFF" | "0" => 0,
+                s => match s.parse::<u16>() {
+                    // Cap at half the period so a typo can't accidentally
+                    // command a 100% duty cycle into the servo.
+                    Ok(v) => v.min(10_000),
+                    Err(_) => {
+                        writeln(class, "bad us (number or 'off')").await?;
+                        return Ok(());
+                    }
+                },
+            };
+            servo_cmd(idx, us);
+            let mut buf: String<64> = String::new();
+            let _ = write!(buf, "ok servo {} {} us\r\n", idx, us);
             write_all(class, buf.as_bytes()).await?;
         }
         _ => {
@@ -522,6 +640,31 @@ async fn main(spawner: Spawner) {
             .expect("fan task pool full"),
     );
 
+    // Servos: four endstop headers repurposed as PWM outputs, plus the
+    // dedicated SERVOS header on GP29. See the SERVO_CHAN_A table for the
+    // slice/channel assignments these calls assume.
+    let cfg0 = servo_base_config();
+    spawner.spawn(
+        servo_task(0, Pwm::new_output_a(p.PWM_SLICE2, p.PIN_4, cfg0.clone()))
+            .expect("servo task pool full"),
+    );
+    spawner.spawn(
+        servo_task(1, Pwm::new_output_b(p.PWM_SLICE1, p.PIN_3, cfg0.clone()))
+            .expect("servo task pool full"),
+    );
+    spawner.spawn(
+        servo_task(2, Pwm::new_output_b(p.PWM_SLICE4, p.PIN_25, cfg0.clone()))
+            .expect("servo task pool full"),
+    );
+    spawner.spawn(
+        servo_task(3, Pwm::new_output_a(p.PWM_SLICE0, p.PIN_16, cfg0.clone()))
+            .expect("servo task pool full"),
+    );
+    spawner.spawn(
+        servo_task(4, Pwm::new_output_b(p.PWM_SLICE6, p.PIN_29, cfg0))
+            .expect("servo task pool full"),
+    );
+
     let driver = Driver::new(p.USB, Irqs);
 
     let mut usb_cfg = Config::new(0x16c0, 0x27dd);
@@ -554,14 +697,17 @@ async fn main(spawner: Spawner) {
         class.wait_connection().await;
         let _ = cli_session(&mut class).await;
         // Disconnect: halt and de-energize so a yanked cable doesn't leave
-        // a coil powered indefinitely. Fans go off too - a stuck-on fan
-        // after the host vanished is a footgun.
+        // a coil powered indefinitely. Fans/servos go off too - a stuck-on
+        // output after the host vanished is a footgun.
         for i in 0..AXES {
             send_cmd(i, AxisCmd::Jog(0));
             send_cmd(i, AxisCmd::Enable(false));
         }
         for i in 0..FANS {
             fan_cmd(i, false);
+        }
+        for i in 0..SERVOS {
+            servo_cmd(i, 0);
         }
     }
 }
