@@ -30,7 +30,7 @@ safe_stop_on_exit = true
 # ---- board 0 ------------------------------------------------------------
 
 [[boards]]
-serial = "/dev/ttyACM2"
+serial = "/dev/ttyACM1"
 name   = "main"
 
 # ---- axes (sticks) -------------------------------------------------------
@@ -192,7 +192,7 @@ mode   = "toggle"
 # Uncomment and adjust the serial path to enable.
 #
 [[boards]]
-serial = "/dev/ttyACM1"
+serial = "/dev/ttyACM0"
 name   = "aux"
 
 # End effector
@@ -220,7 +220,7 @@ target      = "e"
 sensitivity = 500
 deadzone    = 0.10
 invert      = false
-accel       = 1500
+accel       = 200
 
 [[boards.fans]]
 index  = 0
