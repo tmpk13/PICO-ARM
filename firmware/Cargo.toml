@@ -1,6 +1,6 @@
 [package]
 name = "tmc-new-era"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 description = "Bare-bones Rust firmware for the BigTreeTech SKR Pico (RP2040) — USB-CDC CLI to drive X/Y/Z/E steppers"
 
@@ -19,6 +19,8 @@ panic-halt       = "1"
 heapless         = "0.9"
 static_cell      = "2.1"
 portable-atomic  = { version = "1.13", features = ["critical-section"] }
+tmc2209          = { version = "0.3", default-features = false }
+embedded-io-async = "0.7"
 
 [profile.dev]
 # Embassy-time's microsecond delays need optimization to behave sanely.

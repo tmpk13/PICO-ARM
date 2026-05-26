@@ -43,38 +43,83 @@ name   = "main"
 #               raise it for a more responsive feel, lower for smoother
 #               motion. Time from rest to full sensitivity is
 #               approximately sensitivity / accel seconds.
+#
+# ---- TMC2209 UART config (optional, v0.5.0+) -----------------------------
+# `microsteps`      1/2/4/8/16/32/64/128/256. 0 (default) skips the UART
+#                   command and the driver stays in standalone mode where
+#                   MS1/MS2 pins pick the count -- which is *different per
+#                   axis* on the SKR Pico (X=8, Z=32, Y=64, E=16), so the
+#                   same `sensitivity` produces different physical speeds
+#                   across axes. Setting microsteps here normalizes that.
+#                   When you change microsteps, scale `sensitivity` to
+#                   match: e.g. going from standalone Y=64 to UART 16 you
+#                   should divide Y sensitivity by 4.
+# `run_current_ma`  Run-mode RMS current. Common: 600-1000 mA for NEMA17.
+#                   Higher = more torque, hotter coils.
+# `hold_current_ma` Standstill current. Usually 40-60% of run.
+# `hold_delay`      0..15. Power-down delay before dropping to hold
+#                   current. ~2^18/fclk per unit -- 8 is a fine default.
+# `spreadcycle`     false (default) = StealthChop (quiet, lower torque
+#                   at high speed). true = SpreadCycle (noisier, full
+#                   torque, better high-speed tracking).
+# `interpolate`     true (default) = interpolate to 256 ustep internally
+#                   for smoother motion at any configured count.
 
 [[boards.axes]]
-index       = 3
-target      = "x"
-sensitivity = 3000
-deadzone    = 0.10
-invert      = false
-accel       = 4000
+index           = 3
+target          = "x"
+sensitivity     = 3000
+deadzone        = 0.10
+invert          = false
+accel           = 4000
+microsteps      = 16
+run_current_ma  = 800
+hold_current_ma = 400
+hold_delay      = 8
+spreadcycle     = false
+interpolate     = true
 
 [[boards.axes]]
-index       = 1
-target      = "y"
-sensitivity = 2000
-deadzone    = 0.10
-invert      = false
-accel       = 3000
+index           = 1
+target          = "y"
+sensitivity     = 2000
+deadzone        = 0.10
+invert          = false
+accel           = 3000
+microsteps      = 16
+run_current_ma  = 800
+hold_current_ma = 400
+hold_delay      = 8
+spreadcycle     = false
+interpolate     = true
 
 [[boards.axes]]
-index       = 1
-target      = "z"
-sensitivity = 2000
-deadzone    = 0.15
-invert      = false
-accel       = 3000
+index           = 1
+target          = "z"
+sensitivity     = 2000
+deadzone        = 0.15
+invert          = false
+accel           = 3000
+microsteps      = 16
+run_current_ma  = 800
+hold_current_ma = 400
+hold_delay      = 8
+spreadcycle     = false
+interpolate     = true
 
 [[boards.axes]]
-index       = 1
-target      = "e"
-sensitivity = 800
-deadzone    = 0.15
-invert      = false
-accel       = 2000
+index           = 1
+target          = "e"
+sensitivity     = 800
+deadzone        = 0.15
+invert          = false
+accel           = 2000
+microsteps      = 16
+run_current_ma  = 600
+hold_current_ma = 300
+hold_delay      = 8
+spreadcycle     = false
+interpolate     = true
 
 [[boards.fans]]
 index  = 8

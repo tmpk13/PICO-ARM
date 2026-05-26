@@ -95,7 +95,38 @@ struct AxisMap {
     /// (matches pre-0.4.0 behaviour). Sent once at startup with `accel`.
     #[serde(default)]
     accel: u32,
+
+    // ---- TMC2209 UART config (v0.5.0+) -----------------------------------
+    // If `microsteps == 0` the host skips the `tmc` command entirely and
+    // the driver stays in standalone mode (MS1/MS2 pins still select
+    // microstep count). Set microsteps to a valid count (1/2/4/8/16/32/64/
+    // 128/256) to enable UART configuration; the rest of the fields then
+    // apply.
+    /// Microstep count via CHOPCONF.MRES. 0 = skip TMC config.
+    #[serde(default)]
+    microsteps: u16,
+    /// RMS run current in milliamps. Maps to IHOLD_IRUN.IRUN +
+    /// CHOPCONF.vsense.
+    #[serde(default = "default_run_current_ma")]
+    run_current_ma: u32,
+    /// RMS hold current in milliamps (standstill).
+    #[serde(default = "default_hold_current_ma")]
+    hold_current_ma: u32,
+    /// Power-down delay after motion stops, 0..15 (each unit ~2^18 / fclk).
+    #[serde(default = "default_hold_delay")]
+    hold_delay: u8,
+    /// false = StealthChop (quiet), true = SpreadCycle (more torque).
+    #[serde(default)]
+    spreadcycle: bool,
+    /// Interpolate to 256 microsteps in the driver. Smoother motion at
+    /// any configured microstep count; recommended on.
+    #[serde(default = "default_true")]
+    interpolate: bool,
 }
+
+fn default_run_current_ma() -> u32 { 800 }
+fn default_hold_current_ma() -> u32 { 400 }
+fn default_hold_delay() -> u8 { 8 }
 
 #[derive(Debug, Deserialize, Clone)]
 struct ButtonMap {
@@ -626,6 +657,36 @@ fn main() -> Result<()> {
         let tx = spawn_serial_threads(port, label.clone())?;
         links.push(BoardLink { label, tx });
     }
+
+    // Driver-level config first (UART writes change microstep count and
+    // current, which the host's step-rate values are implicitly relative
+    // to). Then motion limits. Then enable.
+    //
+    // Skip the `tmc` command when microsteps == 0 -- that's the signal
+    // to leave the driver in standalone mode (MS1/MS2 picks microsteps,
+    // current is whatever the driver came up at). Backward-compatible
+    // with pre-0.5.0 configs.
+    for (board_idx, board) in cfg.boards.iter().enumerate() {
+        let link = &links[board_idx];
+        for map in &board.axes {
+            let Some(target) = axis_token(&map.target) else { continue };
+            if map.microsteps != 0 {
+                send(link, &format!(
+                    "tmc {target} {} {} {} {} {} {}\r\n",
+                    map.microsteps,
+                    map.run_current_ma,
+                    map.hold_current_ma,
+                    map.hold_delay,
+                    if map.spreadcycle { 1 } else { 0 },
+                    if map.interpolate { 1 } else { 0 },
+                ), cfg.log);
+            }
+        }
+    }
+    // Give the firmware a moment to flush the UART writes before we move
+    // on to motion config -- `tmc` is queued and applied asynchronously
+    // on the firmware side.
+    thread::sleep(Duration::from_millis(200));
 
     // Push per-axis accel limits to each board before enabling. Defaults
     // to 0 (instant) when the field is absent, which preserves pre-0.4.0

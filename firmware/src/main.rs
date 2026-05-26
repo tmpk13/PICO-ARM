@@ -27,21 +27,26 @@ use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_rp::bind_interrupts;
 use embassy_rp::gpio::{Level, Output};
-use embassy_rp::peripherals::USB;
+use embassy_rp::peripherals::{UART1, USB};
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
+use embassy_rp::uart::{BufferedInterruptHandler, BufferedUart, Config as UartConfig};
 use embassy_rp::usb::{Driver, InterruptHandler};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use embassy_sync::channel::Channel;
 use embassy_sync::signal::Signal;
-use embassy_time::{Duration, Instant, Timer};
+use embassy_time::{Duration, Instant, Timer, with_timeout};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 use embassy_usb::{Builder, Config, UsbDevice};
+use embedded_io_async::{Read, Write};
 use heapless::String;
 use panic_halt as _;
 use static_cell::StaticCell;
+use tmc2209::reg as tmc_reg;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
+    UART1_IRQ => BufferedInterruptHandler<UART1>;
 });
 
 type UsbDrv = Driver<'static, USB>;
@@ -110,15 +115,19 @@ fn axis_index(s: &str) -> Option<usize> {
 // tasks could in principle update them too if we ever need to (today only
 // `send_cmd` writes).
 struct AxisShadow {
-    enabled: AtomicBool,
-    velocity: AtomicI32,
-    accel:    AtomicU32,
+    enabled:    AtomicBool,
+    velocity:   AtomicI32,
+    accel:      AtomicU32,
+    /// Last-configured microstep count via the `tmc` command. 0 means
+    /// "never set" -- driver is running in standalone mode (MS1/MS2 pins
+    /// select microsteps; see NOTES.md).
+    microsteps: AtomicU16,
 }
 static SHADOW: [AxisShadow; AXES] = [
-    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0), accel: AtomicU32::new(0) },
-    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0), accel: AtomicU32::new(0) },
-    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0), accel: AtomicU32::new(0) },
-    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0), accel: AtomicU32::new(0) },
+    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0), accel: AtomicU32::new(0), microsteps: AtomicU16::new(0) },
+    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0), accel: AtomicU32::new(0), microsteps: AtomicU16::new(0) },
+    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0), accel: AtomicU32::new(0), microsteps: AtomicU16::new(0) },
+    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0), accel: AtomicU32::new(0), microsteps: AtomicU16::new(0) },
 ];
 
 fn send_cmd(idx: usize, cmd: AxisCmd) {
@@ -128,6 +137,143 @@ fn send_cmd(idx: usize, cmd: AxisCmd) {
         AxisCmd::Accel(a)   => SHADOW[idx].accel.store(a, Ordering::Relaxed),
     }
     AXIS_CMD[idx].signal(cmd);
+}
+
+// --------------------------------------------------------------------------
+// TMC2209 UART configuration.
+//
+// All four drivers share GP8 (TX, half-duplex via a series resistor on the
+// SKR Pico) and GP9 (RX). UART addresses come from the MS1/MS2 straps:
+//
+//   X -> 0   Z -> 1   Y -> 2   E -> 3
+//
+// We bring up UART1 at 115200 baud (TMC2209 auto-bauds off the 0x05 sync
+// byte) and run a single tmc_task that consumes TmcCfg messages from a
+// channel and writes GCONF / IHOLD_IRUN / CHOPCONF to the addressed
+// driver. The drivers don't reply to writes; we still drain the echoed
+// bytes that loop back on our own RX pin so the buffer doesn't overflow
+// across multiple updates.
+//
+// If no `tmc` command is ever sent the UART stays idle and the drivers
+// run in standalone mode (MS1/MS2 still select microsteps, see NOTES.md).
+// --------------------------------------------------------------------------
+
+/// Sense-resistor value on the SKR Pico, in milliohms. Hardcoded because
+/// it's a board-level constant; if you reflash this firmware onto a
+/// different carrier with a different Rsense, change this constant.
+const RSENSE_MOHM: u64 = 110;
+
+/// Per-axis UART address (MS2,MS1 strap order on the SKR Pico):
+/// X=0, Z=1, Y=2, E=3. Indexed by AXES order [X, Y, Z, E].
+const TMC_ADDR: [u8; AXES] = [0, 2, 1, 3];
+
+#[derive(Clone, Copy)]
+struct TmcCfg {
+    axis:        u8,
+    microsteps:  u16,
+    run_ma:      u32,
+    hold_ma:     u32,
+    hold_delay:  u8,
+    spreadcycle: bool,
+    interpolate: bool,
+}
+
+static TMC_CHAN: Channel<CriticalSectionRawMutex, TmcCfg, 8> = Channel::new();
+
+/// Convert a desired RMS current (mA) to a (vsense, CS) pair for the
+/// IHOLD_IRUN register. Uses the standard formula
+///   I_rms = ((CS+1) / 32) * V_fs / (R_sense + 20mohm) / sqrt(2)
+/// solved for CS, with sqrt(2) approximated as 14142/10000. Prefers
+/// vsense=1 (V_fs = 180 mV, higher resolution) when CS fits; falls back
+/// to vsense=0 (V_fs = 325 mV) for higher currents.
+fn current_to_vsense_cs(current_ma: u32) -> (bool, u8) {
+    if current_ma == 0 {
+        return (true, 0);
+    }
+    let r_eff = RSENSE_MOHM + 20;
+    // num = I_mA * R_mohm * 32 * sqrt(2) * 10000  (units: uV * 10000)
+    let num = (current_ma as u64) * r_eff * 32 * 14142;
+    // Denominator absorbs the *10000 sqrt scale: V_fs_mV * 1000 * 10000.
+    // V_fs_mV * 10_000_000 -> rounded division gives (CS+1).
+    let denom_v1 = 180u64 * 10_000_000;
+    let cs_plus1 = (num + denom_v1 / 2) / denom_v1;
+    if cs_plus1 >= 1 && cs_plus1 <= 32 {
+        return (true, (cs_plus1 - 1) as u8);
+    }
+    let denom_v0 = 325u64 * 10_000_000;
+    let cs_plus1 = (num + denom_v0 / 2) / denom_v0;
+    let cs = cs_plus1.saturating_sub(1).min(31);
+    (false, cs as u8)
+}
+
+/// Map a microstep count (8/16/32/64/128/256, or 1/2/4) to CHOPCONF.MRES.
+/// Returns None for unsupported values.
+fn microsteps_to_mres(ms: u16) -> Option<u8> {
+    Some(match ms {
+        256 => 0,
+        128 => 1,
+        64  => 2,
+        32  => 3,
+        16  => 4,
+        8   => 5,
+        4   => 6,
+        2   => 7,
+        1   => 8,
+        _   => return None,
+    })
+}
+
+#[embassy_executor::task]
+async fn tmc_task(mut uart: BufferedUart) {
+    loop {
+        let cfg = TMC_CHAN.receive().await;
+        apply_tmc(&mut uart, cfg).await;
+    }
+}
+
+async fn apply_tmc(uart: &mut BufferedUart, cfg: TmcCfg) {
+    let axis = cfg.axis as usize;
+    if axis >= AXES {
+        return;
+    }
+    let Some(mres) = microsteps_to_mres(cfg.microsteps) else { return };
+    let addr = TMC_ADDR[axis];
+    let (vsense, irun) = current_to_vsense_cs(cfg.run_ma);
+    let (_, ihold)     = current_to_vsense_cs(cfg.hold_ma);
+
+    let mut gconf = tmc_reg::GCONF::default();
+    gconf.set_pdn_disable(true);
+    gconf.set_mstep_reg_select(true);
+    gconf.set_i_scale_analog(false);
+    gconf.set_en_spread_cycle(cfg.spreadcycle);
+
+    let mut ihold_irun = tmc_reg::IHOLD_IRUN::default();
+    ihold_irun.set_irun(irun);
+    ihold_irun.set_ihold(ihold);
+    ihold_irun.set_ihold_delay(cfg.hold_delay);
+
+    let mut chop = tmc_reg::CHOPCONF::default();
+    chop.set_mres(tmc2209::data::MicroStepResolution::from(mres as u32));
+    chop.set_intpol(cfg.interpolate);
+    chop.set_vsense(vsense);
+
+    // Send each write datagram, then drain echoed bytes from our own TX
+    // (single-wire bus loops them back onto RX). Drivers don't respond to
+    // writes so 8 bytes is the full expected echo.
+    tmc_write(uart, tmc2209::WriteRequest::new(addr, gconf).bytes()).await;
+    tmc_write(uart, tmc2209::WriteRequest::new(addr, ihold_irun).bytes()).await;
+    tmc_write(uart, tmc2209::WriteRequest::new(addr, chop).bytes()).await;
+
+    SHADOW[axis].microsteps.store(cfg.microsteps, Ordering::Relaxed);
+}
+
+async fn tmc_write(uart: &mut BufferedUart, datagram: &[u8]) {
+    let _ = uart.write_all(datagram).await;
+    let _ = uart.flush().await;
+    let mut echo = [0u8; 8];
+    // Echoes arrive ~700 us after the last bit at 115200 baud; 20 ms is
+    // overkill but keeps us robust to interrupt latency.
+    let _ = with_timeout(Duration::from_millis(20), uart.read_exact(&mut echo)).await;
 }
 
 // --------------------------------------------------------------------------
@@ -446,6 +592,8 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
             writeln(class, "  move    <axis> <steps> [hz]    one-shot, duration-based").await?;
             writeln(class, "  fan     <0|1|2> <on|off>       SKR Pico fan headers").await?;
             writeln(class, "  servo   <0..4> <us>            0=off, 500..2500 typical").await?;
+            writeln(class, "  tmc     <axis> <ms> <run_ma> <hold_ma> <hold_delay> <sc> <int>").await?;
+            writeln(class, "                                 configure driver over UART").await?;
             writeln(class, "max hz 40000.").await?;
         }
         "version" | "ver" => {
@@ -456,13 +604,15 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
         "status" => {
             let mut buf: String<512> = String::new();
             for i in 0..AXES {
+                let ms = SHADOW[i].microsteps.load(Ordering::Relaxed);
                 let _ = write!(
                     buf,
-                    "  {}: {} vel={} accel={}\r\n",
+                    "  {}: {} vel={} accel={} ms={}\r\n",
                     AXIS_NAMES[i],
                     if SHADOW[i].enabled.load(Ordering::Relaxed) { "EN" } else { "--" },
                     SHADOW[i].velocity.load(Ordering::Relaxed),
                     SHADOW[i].accel.load(Ordering::Relaxed),
+                    ms,
                 );
             }
             for i in 0..FANS {
@@ -518,6 +668,51 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
             }
             let mut buf: String<48> = String::new();
             let _ = write!(buf, "ok accel {} {}\r\n", arg, a);
+            write_all(class, buf.as_bytes()).await?;
+        }
+        "tmc" => {
+            // tmc <axis> <microsteps> <run_ma> <hold_ma> <hold_delay> <spreadcycle> <interpolate>
+            let parts = [it.next(), it.next(), it.next(), it.next(), it.next(), it.next(), it.next()];
+            let [Some(axis_s), Some(ms_s), Some(run_s), Some(hold_s), Some(hd_s), Some(sc_s), Some(int_s)] = parts else {
+                writeln(class, "usage: tmc <axis> <ms> <run_ma> <hold_ma> <hold_delay> <sc> <int>").await?;
+                return Ok(());
+            };
+            let Some(idx) = axis_index(axis_s) else {
+                writeln(class, "unknown axis").await?;
+                return Ok(());
+            };
+            let (Ok(ms), Ok(run_ma), Ok(hold_ma), Ok(hold_delay)) = (
+                ms_s.parse::<u16>(),
+                run_s.parse::<u32>(),
+                hold_s.parse::<u32>(),
+                hd_s.parse::<u8>(),
+            ) else {
+                writeln(class, "bad numeric arg").await?;
+                return Ok(());
+            };
+            if microsteps_to_mres(ms).is_none() {
+                writeln(class, "microsteps must be 1/2/4/8/16/32/64/128/256").await?;
+                return Ok(());
+            }
+            let parse_bool = |s: &str| matches!(s, "1" | "true" | "on" | "yes");
+            let cfg = TmcCfg {
+                axis: idx as u8,
+                microsteps: ms,
+                run_ma,
+                hold_ma,
+                hold_delay,
+                spreadcycle: parse_bool(sc_s),
+                interpolate: parse_bool(int_s),
+            };
+            // Channel is bounded; if it fills the host is spamming faster
+            // than the UART task can drain. Drop and tell the host so they
+            // can retry rather than block the CLI forever.
+            if TMC_CHAN.try_send(cfg).is_err() {
+                writeln(class, "busy").await?;
+                return Ok(());
+            }
+            let mut buf: String<80> = String::new();
+            let _ = write!(buf, "ok tmc {} queued\r\n", AXIS_NAMES[idx]);
             write_all(class, buf.as_bytes()).await?;
         }
         "jog" => {
@@ -766,6 +961,26 @@ async fn main(spawner: Spawner) {
         servo_task(4, Pwm::new_output_b(p.PWM_SLICE6, p.PIN_29, cfg0))
             .expect("servo task pool full"),
     );
+
+    // TMC2209 single-wire UART on GP8/GP9 at 115200 baud. The TMC chips
+    // baud-detect off the 0x05 sync byte so any baud in 9600..500000 works.
+    // RX_BUF is sized for the worst-case "configure four axes back to
+    // back" burst (4 axes * 3 writes * 8 bytes = 96 bytes of echo);
+    // tmc_task drains between writes anyway, so 128 is comfortable.
+    static TMC_TX_BUF: StaticCell<[u8; 64]> = StaticCell::new();
+    static TMC_RX_BUF: StaticCell<[u8; 128]> = StaticCell::new();
+    let mut uart_cfg = UartConfig::default();
+    uart_cfg.baudrate = 115_200;
+    let tmc_uart = BufferedUart::new(
+        p.UART1,
+        p.PIN_8,
+        p.PIN_9,
+        Irqs,
+        TMC_TX_BUF.init([0; 64]),
+        TMC_RX_BUF.init([0; 128]),
+        uart_cfg,
+    );
+    spawner.spawn(tmc_task(tmc_uart).expect("tmc task pool full"));
 
     let driver = Driver::new(p.USB, Irqs);
 

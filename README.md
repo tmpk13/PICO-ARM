@@ -95,13 +95,18 @@ The host:
 `log = true` in the config prints every command it sends - useful for
 first bring-up.
 
-## Caveats
+## Driver configuration
 
-The TMC2209 drivers on the SKR Pico are wired for single-wire UART control
-(addresses 0, 2, 1, 3 for X/Y/Z/E on GP8/GP9). This firmware does **not**
-talk UART - it only pulses STEP/DIR/EN. The drivers therefore run in
-*standalone* mode, where MS1/MS2 (which also set the UART address) select
-the microstep count:
+The TMC2209 drivers on the SKR Pico are wired for single-wire UART
+control (addresses 0, 2, 1, 3 for X/Y/Z/E on GP8/GP9). As of v0.5.0
+the firmware configures them via UART when the host sends a `tmc`
+command (which it does at startup for every axis with `microsteps`
+set in the config).
+
+Without a `tmc` command -- i.e. when the per-axis `microsteps` field
+is left at its default of 0 -- the drivers run in *standalone* mode,
+where MS1/MS2 (which also set the UART address) select the
+microstep count:
 
 | Axis | UART addr (MS2,MS1) | Standalone microsteps |
 |------|---------------------|-----------------------|
@@ -110,9 +115,10 @@ the microstep count:
 | Z    | 1 (0,1)             | 32                    |
 | E    | 3 (1,1)             | 16                    |
 
-So the same `steps` count produces different mm of motion per axis. See
-[NOTES.md](NOTES.md) for what a UART-config pass would need to do.
+In standalone mode the same `steps` count produces different mm of
+motion per axis, and run/hold current sit at the driver's standalone
+defaults (~580 mA-ish). Fine for smoke testing; for anything you care
+about, set `microsteps` + `run_current_ma` + `hold_current_ma` in the
+host config so the UART path runs.
 
-Run current and hold current are also at the standalone defaults rather
-than the values in the Klipper config. Fine for light testing; check
-driver temperatures for sustained motion.
+See [NOTES.md](NOTES.md) for the protocol and current-calc details.
