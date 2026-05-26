@@ -30,7 +30,7 @@ safe_stop_on_exit = true
 # ---- board 0 ------------------------------------------------------------
 
 [[boards]]
-serial = "/dev/serial/by-id/usb-tmc-new-era_SKR_Pico_Stepper_CLI_5044340410315D1C-if00@"
+serial = "/dev/serial/by-id/usb-tmc-new-era_SKR_Pico_Stepper_CLI_5044340410315D1C-if00"
 
 name   = "main"
 
@@ -193,7 +193,7 @@ mode   = "toggle"
 # Uncomment and adjust the serial path to enable.
 #
 [[boards]]
-serial = "/dev/serial/by-id/usb-tmc-new-era_SKR_Pico_Stepper_CLI_5044340408D1B41C-if00@"
+serial = "/dev/serial/by-id/usb-tmc-new-era_SKR_Pico_Stepper_CLI_5044340408D1B41C-if00"
 name   = "aux"
 
 # End effector
@@ -218,7 +218,7 @@ accel       = 1500
 [[boards.axes]]
 index       = 5
 target      = "e"
-sensitivity = 500
+sensitivity = 200
 deadzone    = 0.10
 invert      = false
 accel       = 200
