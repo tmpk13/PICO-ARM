@@ -91,6 +91,10 @@ struct AxisMap {
     /// Flip the sign of the stick reading.
     #[serde(default)]
     invert: bool,
+    /// Firmware-side acceleration limit, steps/sec/sec. 0 = instant slew
+    /// (matches pre-0.4.0 behaviour). Sent once at startup with `accel`.
+    #[serde(default)]
+    accel: u32,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -621,6 +625,19 @@ fn main() -> Result<()> {
 
         let tx = spawn_serial_threads(port, label.clone())?;
         links.push(BoardLink { label, tx });
+    }
+
+    // Push per-axis accel limits to each board before enabling. Defaults
+    // to 0 (instant) when the field is absent, which preserves pre-0.4.0
+    // behaviour. If a user mapped the same target twice with different
+    // accels, the last entry wins -- same convention as the integrator's
+    // jog dispatch.
+    for (board_idx, board) in cfg.boards.iter().enumerate() {
+        let link = &links[board_idx];
+        for map in &board.axes {
+            let Some(target) = axis_token(&map.target) else { continue };
+            send(link, &format!("accel {target} {}\r\n", map.accel), cfg.log);
+        }
     }
 
     if cfg.enable_on_start {

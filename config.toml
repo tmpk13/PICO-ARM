@@ -38,6 +38,11 @@ name   = "main"
 # `sensitivity` steps/sec at full deflection. Try 500-2000 to start.
 # `deadzone`    0..0.95 fraction of stick travel treated as zero.
 # `invert`      flips direction.
+# `accel`       firmware-side ramp limit, steps/sec/sec. 0 = instant
+#               (snappy but jerky). 1000-5000 is a sane starting band;
+#               raise it for a more responsive feel, lower for smoother
+#               motion. Time from rest to full sensitivity is
+#               approximately sensitivity / accel seconds.
 
 [[boards.axes]]
 index       = 3
@@ -45,6 +50,7 @@ target      = "x"
 sensitivity = 3000
 deadzone    = 0.10
 invert      = false
+accel       = 4000
 
 [[boards.axes]]
 index       = 1
@@ -52,6 +58,7 @@ target      = "y"
 sensitivity = 2000
 deadzone    = 0.10
 invert      = false
+accel       = 3000
 
 [[boards.axes]]
 index       = 1
@@ -59,6 +66,7 @@ target      = "z"
 sensitivity = 2000
 deadzone    = 0.15
 invert      = false
+accel       = 3000
 
 [[boards.axes]]
 index       = 1
@@ -66,6 +74,7 @@ target      = "e"
 sensitivity = 800
 deadzone    = 0.15
 invert      = false
+accel       = 2000
 
 [[boards.fans]]
 index  = 8
@@ -141,13 +150,14 @@ mode   = "toggle"
 serial = "/dev/ttyACM1"
 name   = "aux"
 
-# End effector 
+# End effector
 [[boards.axes]]
 index       = 0
 target      = "x"
 sensitivity = 500
 deadzone    = 0.10
 invert      = false
+accel       = 1500
 
 # End effector pivot
 [[boards.axes]]
@@ -156,6 +166,7 @@ target      = "z"
 sensitivity = 500
 deadzone    = 0.10
 invert      = false
+accel       = 1500
 
 # End effector wrist
 [[boards.axes]]
@@ -164,6 +175,7 @@ target      = "e"
 sensitivity = 500
 deadzone    = 0.10
 invert      = false
+accel       = 1500
 
 [[boards.fans]]
 index  = 0

@@ -1,6 +1,6 @@
 [package]
 name = "tmc-new-era"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Bare-bones Rust firmware for the BigTreeTech SKR Pico (RP2040) — USB-CDC CLI to drive X/Y/Z/E steppers"
 

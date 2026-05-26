@@ -4,6 +4,7 @@
 //
 //     help
 //     enable all
+//     accel x 2000         # ramp limit: 2000 steps/sec/sec (0 = instant)
 //     jog x 800            # continuous: positive direction, 800 steps/sec
 //     jog x -400           # reverse at 400 steps/sec
 //     jog x 0              # stop
@@ -20,7 +21,7 @@
 #![no_main]
 
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, Ordering};
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
@@ -60,6 +61,8 @@ enum AxisCmd {
     Enable(bool),
     /// Signed steps/second. 0 = stop (motion only; doesn't change EN).
     Jog(i32),
+    /// Acceleration slew limit, steps/sec/sec. 0 = instant (no ramp).
+    Accel(u32),
 }
 
 const AXES: usize = 4;
@@ -68,6 +71,13 @@ const FANS: usize = 3;
 const SERVOS: usize = 5;
 const SERVO_NAMES: [&str; SERVOS] = ["X-STOP", "Y-STOP", "Z-STOP", "E0-STOP", "SERVOS"];
 const MAX_HZ: u32 = 40_000;
+/// Snap floor for the ramp generator. When the target is well above this
+/// rate we don't let |current_v| dwell below it -- otherwise the first
+/// step after rest waits a sub-1Hz period (multi-second) for the timer
+/// to fire. Skipping the sub-START_HZ band of velocities is the price.
+/// Targets below the floor ramp naturally (host heartbeats at 25 ms
+/// drive the slew forward).
+const START_HZ: i32 = 20;
 const FW_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Deadman timeout. If an axis has nonzero velocity and no jog command
@@ -102,18 +112,20 @@ fn axis_index(s: &str) -> Option<usize> {
 struct AxisShadow {
     enabled: AtomicBool,
     velocity: AtomicI32,
+    accel:    AtomicU32,
 }
 static SHADOW: [AxisShadow; AXES] = [
-    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0) },
-    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0) },
-    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0) },
-    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0) },
+    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0), accel: AtomicU32::new(0) },
+    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0), accel: AtomicU32::new(0) },
+    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0), accel: AtomicU32::new(0) },
+    AxisShadow { enabled: AtomicBool::new(false), velocity: AtomicI32::new(0), accel: AtomicU32::new(0) },
 ];
 
 fn send_cmd(idx: usize, cmd: AxisCmd) {
     match cmd {
         AxisCmd::Enable(on) => SHADOW[idx].enabled.store(on, Ordering::Relaxed),
-        AxisCmd::Jog(hz) => SHADOW[idx].velocity.store(hz, Ordering::Relaxed),
+        AxisCmd::Jog(hz)    => SHADOW[idx].velocity.store(hz, Ordering::Relaxed),
+        AxisCmd::Accel(a)   => SHADOW[idx].accel.store(a, Ordering::Relaxed),
     }
     AXIS_CMD[idx].signal(cmd);
 }
@@ -248,14 +260,21 @@ async fn axis_task(
 
     let sig = &AXIS_CMD[idx];
     let mut enabled = false;
-    let mut velocity: i32 = 0;
+    // Velocity is tracked in milli-Hz fixed point so a slow ramp (small
+    // accel * short dt) doesn't truncate to zero increment.
+    let mut target_v: i32 = 0;
+    let mut current_milli: i64 = 0;
+    let mut accel: u32 = 0; // steps/sec/sec; 0 = instant
     let mut last_cmd_at = Instant::now();
+    let mut last_slew_at = Instant::now();
+    let mut last_dir_sign: i32 = 0;
 
     let apply = |cmd: AxisCmd,
                  enabled: &mut bool,
-                 velocity: &mut i32,
+                 target_v: &mut i32,
+                 current_milli: &mut i64,
+                 accel: &mut u32,
                  last_cmd_at: &mut Instant,
-                 dir: &mut Output<'static>,
                  en: &mut Output<'static>| {
         *last_cmd_at = Instant::now();
         match cmd {
@@ -265,55 +284,113 @@ async fn axis_task(
                     en.set_low();
                 } else {
                     en.set_high();
-                    *velocity = 0;
+                    *target_v = 0;
+                    *current_milli = 0;
                 }
             }
             AxisCmd::Jog(hz) => {
-                *velocity = hz;
-                if hz != 0 {
-                    if !*enabled {
-                        en.set_low();
-                        *enabled = true;
-                    }
-                    if hz > 0 {
-                        dir.set_high();
-                    } else {
-                        dir.set_low();
-                    }
+                *target_v = hz;
+                if hz != 0 && !*enabled {
+                    en.set_low();
+                    *enabled = true;
                 }
+            }
+            AxisCmd::Accel(a) => {
+                *accel = a;
             }
         }
     };
 
     loop {
-        if velocity == 0 {
+        let cur_hz = (current_milli / 1000) as i32;
+
+        if cur_hz == 0 && target_v == 0 {
+            // Truly idle - block until a command arrives.
             let cmd = sig.wait().await;
-            apply(cmd, &mut enabled, &mut velocity, &mut last_cmd_at, &mut dir, &mut en);
+            apply(cmd, &mut enabled, &mut target_v, &mut current_milli, &mut accel,
+                  &mut last_cmd_at, &mut en);
+            last_slew_at = Instant::now();
             continue;
         }
 
-        step.set_high();
-        Timer::after(Duration::from_micros(2)).await;
-        step.set_low();
+        // Sync DIR pin to the current velocity's sign. We do this before
+        // the pulse so the driver sees a stable DIR by the time STEP rises;
+        // the surrounding code paths add ample setup margin over the
+        // TMC2209's 20 ns requirement.
+        let sign = cur_hz.signum();
+        if sign != 0 && sign != last_dir_sign {
+            if sign > 0 { dir.set_high(); } else { dir.set_low(); }
+            last_dir_sign = sign;
+        }
 
-        let abs_hz = velocity.unsigned_abs() as u64;
-        let period_us = (1_000_000u64 / abs_hz.max(1)).max(4);
-        let remaining = period_us.saturating_sub(2).max(2);
+        // Step pulse only if we're actually moving. When |current| is below
+        // 1 Hz we just tick at 1 ms while the ramp builds.
+        let stepping = cur_hz != 0;
+        if stepping {
+            step.set_high();
+            Timer::after(Duration::from_micros(2)).await;
+            step.set_low();
+        }
 
-        match select(Timer::after(Duration::from_micros(remaining)), sig.wait()).await {
+        let abs_hz = cur_hz.unsigned_abs() as u64;
+        let period_us: u64 = if abs_hz > 0 {
+            (1_000_000u64 / abs_hz).max(4)
+        } else {
+            1000
+        };
+        let wait_us = if stepping {
+            period_us.saturating_sub(2).max(2)
+        } else {
+            period_us
+        };
+
+        let result = select(Timer::after(Duration::from_micros(wait_us)), sig.wait()).await;
+
+        // Slew current_milli toward target using the actual elapsed time --
+        // works the same whether we got preempted by a command or rode the
+        // timer out.
+        let now = Instant::now();
+        let dt_us = now.duration_since(last_slew_at).as_micros() as i64;
+        last_slew_at = now;
+        if accel == 0 {
+            current_milli = (target_v as i64) * 1000;
+        } else {
+            let target_milli = (target_v as i64) * 1000;
+            let max_dv = (accel as i64).saturating_mul(dt_us) / 1000;
+            let diff = target_milli - current_milli;
+            let dv = diff.clamp(-max_dv, max_dv);
+            current_milli += dv;
+            // Snap up to START_HZ once we're on the target's side of zero,
+            // but only when the target is above the floor (otherwise a
+            // legitimately slow target like 10 Hz would get clamped to 20).
+            // Deceleration crossing zero passes through here naturally
+            // (opposite signs => not on target side => no snap).
+            let floor = (START_HZ as i64) * 1000;
+            let target_milli_abs = (target_v as i64).abs() * 1000;
+            if target_v != 0 && target_milli_abs > floor {
+                let tgt_sign = (target_v as i64).signum();
+                let on_target_side = current_milli.signum() == tgt_sign || current_milli == 0;
+                if on_target_side && current_milli.abs() < floor {
+                    current_milli = tgt_sign * floor;
+                }
+            }
+        }
+
+        match result {
             Either::First(_) => {
-                // Deadman check: if the host has gone silent we halt motion.
-                // Leave EN as-is so we still hold position rather than
-                // collapsing under gravity.
-                if Instant::now().duration_since(last_cmd_at)
-                    > Duration::from_millis(WATCHDOG_MS)
-                {
-                    velocity = 0;
+                // Deadman: host went silent. Hard halt (zero current, not
+                // a graceful decel) so a cable yank doesn't let the arm
+                // coast for the configured decel time. EN stays as-is so
+                // the motor holds position.
+                if now.duration_since(last_cmd_at) > Duration::from_millis(WATCHDOG_MS) {
+                    target_v = 0;
+                    current_milli = 0;
                     SHADOW[idx].velocity.store(0, Ordering::Relaxed);
                 }
             }
             Either::Second(cmd) => {
-                apply(cmd, &mut enabled, &mut velocity, &mut last_cmd_at, &mut dir, &mut en);
+                apply(cmd, &mut enabled, &mut target_v, &mut current_milli, &mut accel,
+                      &mut last_cmd_at, &mut en);
             }
         }
     }
@@ -364,6 +441,7 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
             writeln(class, "  status").await?;
             writeln(class, "  enable  <x|y|z|e|all>").await?;
             writeln(class, "  disable <x|y|z|e|all>").await?;
+            writeln(class, "  accel   <axis|all> <hz/sec>    0=instant slew (default)").await?;
             writeln(class, "  jog     <axis> <signed_hz>     0 stops; sign sets DIR").await?;
             writeln(class, "  move    <axis> <steps> [hz]    one-shot, duration-based").await?;
             writeln(class, "  fan     <0|1|2> <on|off>       SKR Pico fan headers").await?;
@@ -380,10 +458,11 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
             for i in 0..AXES {
                 let _ = write!(
                     buf,
-                    "  {}: {} vel={}\r\n",
+                    "  {}: {} vel={} accel={}\r\n",
                     AXIS_NAMES[i],
                     if SHADOW[i].enabled.load(Ordering::Relaxed) { "EN" } else { "--" },
                     SHADOW[i].velocity.load(Ordering::Relaxed),
+                    SHADOW[i].accel.load(Ordering::Relaxed),
                 );
             }
             for i in 0..FANS {
@@ -417,6 +496,29 @@ async fn run_command(class: &mut Class, line: &str) -> Result<(), Disconnected> 
                 return Ok(());
             }
             writeln(class, if on { "ok enabled" } else { "ok disabled" }).await?;
+        }
+        "accel" => {
+            let (Some(arg), Some(val_s)) = (it.next(), it.next()) else {
+                writeln(class, "usage: accel <axis|all> <hz/sec>").await?;
+                return Ok(());
+            };
+            let Ok(a) = val_s.parse::<u32>() else {
+                writeln(class, "bad accel").await?;
+                return Ok(());
+            };
+            if arg == "all" {
+                for i in 0..AXES {
+                    send_cmd(i, AxisCmd::Accel(a));
+                }
+            } else if let Some(i) = axis_index(arg) {
+                send_cmd(i, AxisCmd::Accel(a));
+            } else {
+                writeln(class, "unknown axis").await?;
+                return Ok(());
+            }
+            let mut buf: String<48> = String::new();
+            let _ = write!(buf, "ok accel {} {}\r\n", arg, a);
+            write_all(class, buf.as_bytes()).await?;
         }
         "jog" => {
             let (Some(axis_s), Some(hz_s)) = (it.next(), it.next()) else {
