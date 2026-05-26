@@ -70,7 +70,7 @@ name   = "main"
 [[boards.axes]]
 index           = 3
 target          = "x"
-sensitivity     = 3000
+sensitivity     = 5000
 deadzone        = 0.20
 invert          = false
 accel           = 4000
@@ -87,7 +87,7 @@ index           = 1
 target          = "y"
 sensitivity     = 2000
 deadzone        = 0.20
-invert          = false
+invert          = true
 accel           = 3000
 microsteps      = 16
 run_current_ma  = 800
@@ -102,7 +102,7 @@ index           = 1
 target          = "z"
 sensitivity     = 2000
 deadzone        = 0.20
-invert          = false
+invert          = true
 accel           = 3000
 microsteps      = 16
 run_current_ma  = 800
@@ -111,35 +111,33 @@ hold_delay      = 8
 spreadcycle     = false
 interpolate     = true
 
-# e == Joint 1
-# [[boards.axes]]
-# index           = 1
-# target          = "e"
-# sensitivity     = 800
-# deadzone        = 0.20
-# invert          = false
-# accel           = 2000
-# microsteps      = 16
-# run_current_ma  = 600
-# hold_current_ma = 300
-# hold_delay      = 8
-# spreadcycle     = false
-# interpolate     = true
+# e == Joint 1 (Bottom)
+[[boards.axes]]
+index           = 2
+target          = "e"
+sensitivity     = 2000
+deadzone        = 0.10
+invert          = false
+accel           = 2000
+microsteps      = 16
+run_current_ma  = 600
+hold_current_ma = 300
+hold_delay      = 8
+spreadcycle     = false
+interpolate     = true
 
-
-
-# e == Joint 1
-[[boards.buttons]]
-index  = 2
-target = "e"
-delta  = 500
-hz     = 1000
-# e == Joint 1
-[[boards.buttons]]
-index  = 3
-target = "e"
-delta  = -500
-hz     = 1000
+# # e == Joint 1 (Bottom)
+# [[boards.buttons]]
+# index  = 2
+# target = "e"
+# delta  = 10000
+# hz     = 1000
+# # e == Joint 1
+# [[boards.buttons]]
+# index  = 3
+# target = "e"
+# delta  = -10000
+# hz     = 1000
 
 
 
@@ -244,19 +242,19 @@ sensitivity = 200
 deadzone    = 0.10
 invert      = false
 accel       = 200
-run_current_ma  = 200
-hold_current_ma = 100
+run_current_ma  = 100
+hold_current_ma = 10
 
 [[boards.fans]]
 index  = 0
 target = 2
 mode   = "momentary"
 
-[[boards.servo_axes]]
-index     = 2          # joystick axis
-target    = 4          # SERVOS header (GP29)
-min_us    = 1000
-max_us    = 2000
-center_us = 1500
-deadzone  = 0.00
-invert    = false
+# [[boards.servo_axes]]
+# index     = 2          # joystick axis
+# target    = 4          # SERVOS header (GP29)
+# min_us    = 1000
+# max_us    = 2000
+# center_us = 1500
+# deadzone  = 0.00
+# invert    = false
