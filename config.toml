@@ -30,7 +30,8 @@ safe_stop_on_exit = true
 # ---- board 0 ------------------------------------------------------------
 
 [[boards]]
-serial = "/dev/ttyACM1"
+serial = "/dev/serial/by-id/usb-tmc-new-era_SKR_Pico_Stepper_CLI_5044340410315D1C-if00@"
+
 name   = "main"
 
 # ---- axes (sticks) -------------------------------------------------------
