@@ -192,7 +192,7 @@ mode   = "toggle"
 # Uncomment and adjust the serial path to enable.
 #
 [[boards]]
-serial = "/dev/ttyACM0"
+serial = "/dev/serial/by-id/usb-tmc-new-era_SKR_Pico_Stepper_CLI_5044340408D1B41C-if00@"
 name   = "aux"
 
 # End effector

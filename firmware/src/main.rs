@@ -26,6 +26,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU32, Ordering};
 use embassy_executor::Spawner;
 use embassy_futures::select::{Either, select};
 use embassy_rp::bind_interrupts;
+use embassy_rp::flash::{Blocking, Flash};
 use embassy_rp::gpio::{Level, Output};
 use embassy_rp::peripherals::{UART1, USB};
 use embassy_rp::pwm::{Config as PwmConfig, Pwm};
@@ -984,10 +985,24 @@ async fn main(spawner: Spawner) {
 
     let driver = Driver::new(p.USB, Irqs);
 
+    // Derive USB serial from the RP2040 flash unique ID so each board gets a
+    // distinct /dev/serial/by-id path without per-board build flags.
+    let mut flash = Flash::<_, Blocking, { 2 * 1024 * 1024 }>::new_blocking(p.FLASH);
+    let mut uid = [0u8; 8];
+    flash.blocking_unique_id(&mut uid).unwrap();
+    static SN_BUF: StaticCell<[u8; 16]> = StaticCell::new();
+    let sn_buf = SN_BUF.init([0; 16]);
+    for (i, b) in uid.iter().enumerate() {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        sn_buf[i * 2] = HEX[(b >> 4) as usize];
+        sn_buf[i * 2 + 1] = HEX[(b & 0xf) as usize];
+    }
+    let sn: &'static str = core::str::from_utf8(sn_buf).unwrap();
+
     let mut usb_cfg = Config::new(0x16c0, 0x27dd);
     usb_cfg.manufacturer = Some("tmc-new-era");
     usb_cfg.product = Some("SKR Pico Stepper CLI");
-    usb_cfg.serial_number = Some("SKRPICO-001");
+    usb_cfg.serial_number = Some(sn);
     usb_cfg.max_power = 100;
     usb_cfg.max_packet_size_0 = 64;
 
