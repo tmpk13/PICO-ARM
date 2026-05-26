@@ -66,11 +66,12 @@ name   = "main"
 # `interpolate`     true (default) = interpolate to 256 ustep internally
 #                   for smoother motion at any configured count.
 
+# x == Base Pivot
 [[boards.axes]]
 index           = 3
 target          = "x"
 sensitivity     = 3000
-deadzone        = 0.10
+deadzone        = 0.20
 invert          = false
 accel           = 4000
 microsteps      = 16
@@ -80,11 +81,12 @@ hold_delay      = 8
 spreadcycle     = false
 interpolate     = true
 
+# y == Joint 2 (Middle)
 [[boards.axes]]
 index           = 1
 target          = "y"
 sensitivity     = 2000
-deadzone        = 0.10
+deadzone        = 0.20
 invert          = false
 accel           = 3000
 microsteps      = 16
@@ -94,11 +96,12 @@ hold_delay      = 8
 spreadcycle     = false
 interpolate     = true
 
+# z == Joint 3 (End)
 [[boards.axes]]
 index           = 1
 target          = "z"
 sensitivity     = 2000
-deadzone        = 0.15
+deadzone        = 0.20
 invert          = false
 accel           = 3000
 microsteps      = 16
@@ -108,19 +111,38 @@ hold_delay      = 8
 spreadcycle     = false
 interpolate     = true
 
-[[boards.axes]]
-index           = 1
-target          = "e"
-sensitivity     = 800
-deadzone        = 0.15
-invert          = false
-accel           = 2000
-microsteps      = 16
-run_current_ma  = 600
-hold_current_ma = 300
-hold_delay      = 8
-spreadcycle     = false
-interpolate     = true
+# e == Joint 1
+# [[boards.axes]]
+# index           = 1
+# target          = "e"
+# sensitivity     = 800
+# deadzone        = 0.20
+# invert          = false
+# accel           = 2000
+# microsteps      = 16
+# run_current_ma  = 600
+# hold_current_ma = 300
+# hold_delay      = 8
+# spreadcycle     = false
+# interpolate     = true
+
+
+
+# e == Joint 1
+[[boards.buttons]]
+index  = 2
+target = "e"
+delta  = 500
+hz     = 1000
+# e == Joint 1
+[[boards.buttons]]
+index  = 3
+target = "e"
+delta  = -500
+hz     = 1000
+
+
+
 
 [[boards.fans]]
 index  = 8
@@ -222,6 +244,8 @@ sensitivity = 200
 deadzone    = 0.10
 invert      = false
 accel       = 200
+run_current_ma  = 200
+hold_current_ma = 100
 
 [[boards.fans]]
 index  = 0
