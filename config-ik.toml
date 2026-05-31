@@ -1,0 +1,202 @@
+# tmc-new-era IK-mode config (ik-host/ik_host.py).
+#
+# Same boards/serial setup as config.toml, but instead of mapping each
+# joystick axis straight to a stepper, three joystick axes drive the
+# end-effector Cartesian target. ik-host runs ikpy over the URDF chain
+# you list below and dispatches `jog <target> <signed_hz>` per joint.
+#
+# IMPORTANT: the arm is assumed to be at `cartesian.home_xyz` when this
+# starts -- there's no encoder feedback. Move the arm to the home pose
+# before launching.
+#
+# Run:
+#   cd ik-host
+#   pixi install               # one-time
+#   pixi run python ik_host.py # uses ../config-ik.toml
+
+device  = "/dev/input/js0"
+poll_hz = 40
+log     = true
+enable_on_start   = true
+safe_stop_on_exit = true
+
+# ---- URDF + IK chain ----------------------------------------------------
+#
+# URDF path is relative to this config file.
+urdf = "pico-arm/urdf/assembly_1.urdf"
+
+# ikpy traverses the URDF tree with a hand-written ordered list of
+# alternating joint/link names. base_type = "joint" means the first
+# entry is a joint name (here we want base_rotation to be part of the
+# chain because a stepper drives it). The chain ends at the link
+# whose pose we want IK to hit -- here part_24, the end of the
+# end-effector linkage.
+chain_base_type = "joint"
+chain_elements  = [
+  "base_rotation",                # joint, continuous
+  "base",                         # link
+  "base_mount",                   # joint, fixed
+  "main_linkage_body",            # link
+  "linkage_1_rotation",           # joint, revolute (driven)
+  "main_linkage_coupler_long",    # link
+  "left_coupler_mount__1_",       # joint, fixed
+  "main_linkage_body_2",          # link
+  "linkage_2_rotation",           # joint, revolute (driven)
+  "main_linkage_coupler_long_1",  # link
+  "left_coupler_mount__2_",       # joint, fixed
+  "main_linkage_body_1",          # link
+  "linkage_3_rotation",           # joint, revolute (driven)
+  "main_linkage_coupler_long_2",  # link
+  "left_coupler_mount__3_",       # joint, fixed
+  "main_linkage_end",             # link
+  "end_effector_attachment",      # joint, fixed
+  "part_23",                      # link
+  "revolute_1",                   # joint, continuous (driven)
+  "part_24",                      # link, IK target frame
+]
+
+# Subset of the joints above that IK should solve and that the host
+# will index into when reading the solution vector. Must match the
+# `joint` field of every [[boards.joints]] entry below.
+active_joints = [
+  "base_rotation",
+  "linkage_1_rotation",
+  "linkage_2_rotation",
+  "linkage_3_rotation",
+  "revolute_1",
+]
+
+# ---- Cartesian workspace -----------------------------------------------
+#
+# Stick deflection maps linearly into [home - range, home + range] on
+# each axis. URDF units are meters. Start with a small range and
+# loosen once you've verified the joints aren't fighting each other.
+#
+# axis_{x,y,z} pick which joystick axis indices steer each Cartesian
+# direction. Use jstest /dev/input/js0 to find them on your controller.
+
+[cartesian]
+home_xyz  = [0.0, -0.10, 0.10]   # meters in URDF root frame
+range_xyz = [0.4, 0.4, 0.6]
+axis_x   = 3
+axis_y   = 1
+axis_z   = 2
+deadzone = 0.20
+invert_x = false
+invert_y = false
+invert_z = false
+
+# ---- board 0 -----------------------------------------------------------
+
+[[boards]]
+serial = "/dev/serial/by-id/usb-tmc-new-era_SKR_Pico_Stepper_CLI_5044340410315D1C-if00"
+name   = "main"
+
+# [[boards.joints]] is the IK-aware equivalent of [[boards.axes]] from
+# config.toml. Each entry binds one stepper axis (target = x|y|z|e) to
+# one URDF joint and tells the host how many motor steps equal one
+# radian of joint motion. Calibrate empirically: jog the joint a known
+# angle and divide the steps you sent by the radians it moved.
+#
+# TMC fields are identical to config.toml.
+
+# x stepper drives base_rotation
+[[boards.joints]]
+target          = "x"
+joint           = "base_rotation"
+steps_per_rad   = 5093     # 200 full steps * 16 ustep * gear_ratio / (2*pi)
+invert          = false
+accel           = 4000
+microsteps      = 16
+run_current_ma  = 800
+hold_current_ma = 400
+hold_delay      = 8
+spreadcycle     = false
+interpolate     = true
+
+# e stepper drives linkage_1_rotation (Joint 1 / bottom)
+[[boards.joints]]
+target          = "e"
+joint           = "linkage_1_rotation"
+steps_per_rad   = 5093
+invert          = false
+accel           = 2000
+microsteps      = 16
+run_current_ma  = 600
+hold_current_ma = 300
+hold_delay      = 8
+spreadcycle     = false
+interpolate     = true
+
+# y stepper drives linkage_2_rotation (Joint 2 / middle)
+[[boards.joints]]
+target          = "y"
+joint           = "linkage_2_rotation"
+steps_per_rad   = 5093
+invert          = true
+accel           = 3000
+microsteps      = 16
+run_current_ma  = 800
+hold_current_ma = 400
+hold_delay      = 8
+spreadcycle     = false
+interpolate     = true
+
+# z stepper drives linkage_3_rotation (Joint 3 / end)
+[[boards.joints]]
+target          = "z"
+joint           = "linkage_3_rotation"
+steps_per_rad   = 5093
+invert          = true
+accel           = 3000
+microsteps      = 16
+run_current_ma  = 800
+hold_current_ma = 400
+hold_delay      = 8
+spreadcycle     = false
+interpolate     = true
+
+[[boards.fans]]
+index = 8
+target = 0
+mode = "toggle"
+
+# ---- board 1 -----------------------------------------------------------
+
+[[boards]]
+serial = "/dev/serial/by-id/usb-tmc-new-era_SKR_Pico_Stepper_CLI_5044340408D1B41C-if00"
+name   = "aux"
+
+# z stepper drives revolute_1 (end-effector pivot in the URDF)
+[[boards.joints]]
+target        = "z"
+joint         = "revolute_1"
+steps_per_rad = 1500
+invert        = false
+accel         = 1500
+
+# Wrist and gripper aren't in the IK chain -- keep the old
+# stick-velocity mapping for them via [[boards.axes]] (same fields as
+# config.toml).
+[[boards.axes]]
+index       = 0
+target      = "x"
+sensitivity = 500
+deadzone    = 0.10
+invert      = false
+accel       = 1500
+
+[[boards.axes]]
+index       = 5
+target      = "e"
+sensitivity = 200
+deadzone    = 0.10
+invert      = false
+accel       = 200
+run_current_ma  = 100
+hold_current_ma = 10
+
+[[boards.fans]]
+index = 0
+target = 2
+mode = "momentary"

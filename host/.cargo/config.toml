@@ -1,0 +1,25 @@
+# Cross-compile to Raspberry Pi B+ rev 1.2 (BCM2835 / ARM1176JZF-S, ARMv6 + VFPv2).
+#
+# Use the musl target for the B+: Debian/Ubuntu's gcc-arm-linux-gnueabihf
+# ships ARMv7-tagged crt/libc/libgcc, so a glibc build SIGILLs on the B+
+# even with rustc emitting v6 code. musl.cc's armv6 toolchain is
+# v6-tagged end-to-end, so the resulting static binary just runs.
+#
+# Build:   cargo build --release --target arm-unknown-linux-musleabihf
+# Output:  target/arm-unknown-linux-musleabihf/release/tmc-new-era-host
+# scp to the Pi and run; no runtime deps.
+
+[target.arm-unknown-linux-musleabihf]
+linker = "/home/tmpk/toolchains/armv6-linux-musleabihf-cross/bin/armv6-linux-musleabihf-gcc"
+rustflags = [
+    "-C", "target-cpu=arm1176jzf-s",
+    "-C", "target-feature=+crt-static",
+]
+
+# Kept for Pi 2/3/4 (ARMv7+) where Debian's armhf toolchain works fine.
+# Do NOT use this for the B+ -- the crt/libc are v7-tagged.
+[target.arm-unknown-linux-gnueabihf]
+linker = "arm-linux-gnueabihf-gcc"
+rustflags = [
+    "-C", "target-cpu=arm1176jzf-s",
+]

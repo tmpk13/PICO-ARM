@@ -1,0 +1,22 @@
+[workspace]
+name = "ik-host"
+version = "0.1.0"
+description = "Onshape URDF-driven IK sidecar for the tmc-new-era host. Reads a joystick, runs ikpy on a URDF, streams jog commands to one or more SKR Picos over USB CDC."
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tasks]
+run = "python ik_host.py"
+
+[dependencies]
+python = ">=3.11,<3.13"
+numpy = ">=1.26,<3"
+scipy = ">=1.11,<2"
+pyserial = ">=3.5,<4"
+
+[pypi-dependencies]
+# ikpy 3.x is conda-forgeable but the conda recipe lags upstream.
+# PyPI keeps current with scipy and the least_squares optimizer that
+# actually enforces URDF joint limits.
+ikpy = ">=3.4,<4"
+tomli = ">=2,<3"

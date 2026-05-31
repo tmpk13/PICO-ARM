@@ -1,0 +1,37 @@
+# EDIT BEFORE INSTALLING.
+#
+# The two things that change per host are the User= line and the three
+# paths (binary, config, ExecStart). Defaults below assume the Pi user
+# is `user` and that you scp'd the cross-built binary + config.toml
+# into the home dir, and that this repo lives at /home/user/tmc-new-era.
+# Adjust if your layout differs. systemd does not expand %h inside
+# Environment= so the paths have to be literal.
+
+[Unit]
+Description=tmc-new-era host auto-launcher (watches for joystick / SKR Pico)
+After=multi-user.target
+# Wait for udev to settle so /dev/serial/by-id and /dev/input/js* are
+# populated before we start probing.
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+
+[Service]
+Type=simple
+Environment=TMC_HOST_BIN=/home/user/tmc-new-era-host
+Environment=TMC_HOST_CONFIG=/home/user/config.toml
+Environment=POLL_SECS=3
+Environment=RESTART_SECS=2
+Environment=REQUIRE_BOTH=0
+ExecStart=/home/user/scripts/auto-host.sh
+Restart=always
+RestartSec=5
+# Needs access to /dev/input/js* (input group) and /dev/serial/by-id/*
+# (dialout / sometimes plugdev). Run as the desktop user so the dev
+# workflow and the service see the same permissions.
+User=user
+SupplementaryGroups=dialout input plugdev
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
