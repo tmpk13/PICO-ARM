@@ -5,6 +5,8 @@ the URDF chain. Touches no hardware."""
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).parent))
 
 from ik_host import IkSolver, load_config  # noqa: E402
@@ -38,6 +40,30 @@ def main() -> int:
         print(f"\nsolving {t}")
         for j, a in zip(ik.joint_index, delta):
             print(f"  {j:24s} = {a:+.4f} rad")
+
+    # --- Velocity-level (Jacobian DLS) path -----------------------------
+    # Rebuild a clean home solution, then resolve a unit EE velocity along
+    # each axis into joint rates. Verifies the new control path: a finite
+    # Jacobian, a solvable DLS system, and that pushing +x actually moves
+    # the end effector toward +x (J @ q_dot ~ v).
+    print("\n--- Jacobian DLS resolved-rate ---")
+    q = ik.solve(home).copy()
+    active = list(ik.joint_index.values())
+    lam = cfg.cartesian.dls_lambda
+    jac = ik.position_jacobian(q, active)
+    print(f"Jacobian (3 x {len(active)}):")
+    for r, ax in enumerate("xyz"):
+        print(f"  d{ax}: " + " ".join(f"{c:+.4f}" for c in jac[r]))
+    a = jac @ jac.T + lam * lam * np.eye(3)
+    for ax_i, ax in enumerate("xyz"):
+        v = np.zeros(3)
+        v[ax_i] = 0.05  # m/s
+        q_dot = jac.T @ np.linalg.solve(a, v)
+        achieved = jac @ q_dot  # realized EE velocity through the chain
+        err = float(np.linalg.norm(achieved - v))
+        rates = ", ".join(f"{n}={q_dot[k]:+.3f}"
+                          for k, n in enumerate(ik.joint_index))
+        print(f"  v=+{ax} -> q_dot[{rates}]  track_err={err:.4f} m/s")
 
     # Cross-check config -> URDF mapping
     cfg_joints = {jm.joint for b in cfg.boards for jm in b.joints}

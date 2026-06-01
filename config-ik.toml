@@ -51,33 +51,54 @@ chain_elements  = [
   "main_linkage_end",             # link
   "end_effector_attachment",      # joint, fixed
   "part_23",                      # link
-  "revolute_1",                   # joint, continuous (driven)
+  "revolute_1",                   # joint, continuous (held, not IK-driven)
   "part_24",                      # link, IK target frame
 ]
 
 # Subset of the joints above that IK should solve and that the host
 # will index into when reading the solution vector. Must match the
 # `joint` field of every [[boards.joints]] entry below.
+# Only the base and the three main linkage joints are IK-driven. That is
+# 4 joints for a 3-DOF position target -- one redundant DOF, which DLS
+# resolves fine. revolute_1 (the end-effector pivot) stays in the chain
+# below so IK still reaches part_24, but it is held at its home value,
+# not solved.
 active_joints = [
   "base_rotation",
   "linkage_1_rotation",
   "linkage_2_rotation",
   "linkage_3_rotation",
-  "revolute_1",
 ]
 
 # ---- Cartesian workspace -----------------------------------------------
 #
-# Stick deflection maps linearly into [home - range, home + range] on
-# each axis. URDF units are meters. Start with a small range and
-# loosen once you've verified the joints aren't fighting each other.
+# Velocity-level (resolved-rate) control: stick deflection maps to a
+# commanded end-effector linear velocity, resolved through the position
+# Jacobian (damped least squares) to per-joint rates. At zero deflection
+# every joint rate is 0, so the arm holds still -- there is no pose
+# setpoint to chase.
 #
-# axis_{x,y,z} pick which joystick axis indices steer each Cartesian
-# direction. Use jstest /dev/input/js0 to find them on your controller.
+# home_xyz       starting EE pose (m, URDF root frame); the arm is
+#                assumed parked here at launch (no encoders).
+# max_speed_xyz  EE linear speed at full stick deflection, per axis (m/s).
+#                Start small and loosen once motion looks sane.
+# dls_lambda     damped-least-squares damping. Larger = robust near
+#                singularities but mushier; smaller = crisper but twitchy
+#                at workspace edges. 0.05 is a sane start.
+# axis_{x,y,z}   joystick axis indices steering each Cartesian direction.
+#                Use jstest /dev/input/js0 to find them. Pick analog
+#                STICK axes -- a trigger axis rests at -32768, not 0.
+#                (The host now subtracts each axis's rest value at
+#                startup, but sticks are still the intuitive choice.)
+#
+# range_xyz is retained only as the fallback for max_speed_xyz when the
+# latter is omitted; it is otherwise unused in velocity mode.
 
 [cartesian]
-home_xyz  = [0.0, -0.10, 0.10]   # meters in URDF root frame
-range_xyz = [0.4, 0.4, 0.6]
+home_xyz      = [0.0, -0.10, 0.10]   # meters in URDF root frame
+range_xyz     = [0.4, 0.4, 0.6]
+max_speed_xyz = [0.08, 0.08, 0.08]   # m/s at full deflection
+dls_lambda    = 0.05
 axis_x   = 3
 axis_y   = 1
 axis_z   = 2
@@ -167,13 +188,11 @@ mode = "toggle"
 serial = "/dev/serial/by-id/usb-tmc-new-era_SKR_Pico_Stepper_CLI_5044340408D1B41C-if00"
 name   = "aux"
 
-# z stepper drives revolute_1 (end-effector pivot in the URDF)
-[[boards.joints]]
-target        = "z"
-joint         = "revolute_1"
-steps_per_rad = 1500
-invert        = false
-accel         = 1500
+# revolute_1 (end-effector pivot, aux z stepper) is no longer IK-driven:
+# only the base and three main joints are. The pivot is held at its home
+# value by IK. The z stepper here is therefore left unwired -- add a
+# [[boards.axes]] entry for it if you want manual stick control of the
+# wrist.
 
 # Wrist and gripper aren't in the IK chain -- keep the old
 # stick-velocity mapping for them via [[boards.axes]] (same fields as

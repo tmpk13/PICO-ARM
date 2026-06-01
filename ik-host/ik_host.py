@@ -116,7 +116,14 @@ class CartesianCfg:
     invert_x: bool = False
     invert_y: bool = False
     invert_z: bool = False
-    max_step_per_tick: float = 0.005  # m, target-rate clamp
+    # Max end-effector linear speed at full stick deflection, per axis
+    # (m/s). Stick deflection maps linearly to commanded EE velocity.
+    # Defaults to range_xyz when absent so old configs keep a sane scale.
+    max_speed_xyz: tuple[float, float, float] = (0.1, 0.1, 0.1)
+    # Damped-least-squares damping factor lambda. Larger = more robust
+    # near singularities but more tracking error; smaller = crisper but
+    # twitchy at workspace edges.
+    dls_lambda: float = 0.05
 
 
 @dataclass
@@ -146,9 +153,12 @@ def load_config(path: Path) -> Config:
     cart_raw = raw.get("cartesian")
     if cart_raw is None:
         raise ValueError("config missing [cartesian] block")
+    range_xyz = tuple(cart_raw["range_xyz"])
+    ms = _opt(cart_raw, "max_speed_xyz", range_xyz)
+    max_speed = (float(ms[0]), float(ms[1]), float(ms[2]))
     cart = CartesianCfg(
         home_xyz=tuple(cart_raw["home_xyz"]),
-        range_xyz=tuple(cart_raw["range_xyz"]),
+        range_xyz=range_xyz,
         axis_x=int(cart_raw["axis_x"]),
         axis_y=int(cart_raw["axis_y"]),
         axis_z=int(cart_raw["axis_z"]),
@@ -156,7 +166,8 @@ def load_config(path: Path) -> Config:
         invert_x=bool(_opt(cart_raw, "invert_x", False)),
         invert_y=bool(_opt(cart_raw, "invert_y", False)),
         invert_z=bool(_opt(cart_raw, "invert_z", False)),
-        max_step_per_tick=float(_opt(cart_raw, "max_step_per_tick", 0.005)),
+        max_speed_xyz=max_speed,
+        dls_lambda=float(_opt(cart_raw, "dls_lambda", 0.05)),
     )
 
     boards = []
@@ -337,6 +348,23 @@ class IkSolver:
     def joint_angle(self, sol: np.ndarray, joint: str) -> float:
         return float(sol[self.joint_index[joint]])
 
+    def ee_position(self, q: np.ndarray) -> np.ndarray:
+        """End-effector position (xyz) for a full joint vector q."""
+        return np.asarray(self.chain.forward_kinematics(q))[:3, 3]
+
+    def position_jacobian(self, q: np.ndarray, active: list[int],
+                          eps: float = 1e-6) -> np.ndarray:
+        """3 x len(active) finite-difference Jacobian d(ee_xyz)/dq for the
+        driven joints. ikpy exposes no analytic Jacobian, but FK is a few
+        4x4 mults so perturbing each driven joint once per tick is cheap."""
+        p0 = self.ee_position(q)
+        jac = np.zeros((3, len(active)))
+        for k, idx in enumerate(active):
+            qp = q.copy()
+            qp[idx] += eps
+            jac[:, k] = (self.ee_position(qp) - p0) / eps
+        return jac
+
 
 # -----------------------------------------------------------------------------
 # Joystick reader
@@ -354,6 +382,13 @@ class JoystickReader(threading.Thread):
         self.on_button = on_button
         self._lock = threading.Lock()
         self._axes: list[int] = []
+        # Per-axis rest value, learned from the synthetic JS_EVENT_INIT
+        # events the kernel emits when the device is opened. Triggers
+        # (and any off-center stick) report their rest value here, and we
+        # subtract it so "untouched" is always 0 -- otherwise a trigger
+        # resting at -32768 reads as full deflection and jogs an axis the
+        # moment the host starts.
+        self._rest: list[int] = []
         self.connected = False
         self._stop = threading.Event()
 
@@ -362,12 +397,24 @@ class JoystickReader(threading.Thread):
 
     def axes_snapshot(self) -> list[int]:
         with self._lock:
-            return list(self._axes)
+            out: list[int] = []
+            for i, a in enumerate(self._axes):
+                r = self._rest[i] if i < len(self._rest) else 0
+                v = a - r
+                if v > JS_MAX:
+                    v = int(JS_MAX)
+                elif v < -JS_MAX:
+                    v = -int(JS_MAX)
+                out.append(v)
+            return out
 
     def _zero_axes(self):
         with self._lock:
             for i in range(len(self._axes)):
                 self._axes[i] = 0
+            # Drop the learned rest bias; it is relearned from the INIT
+            # events of the next connection.
+            self._rest = []
 
     def run(self):
         warned = False
@@ -417,6 +464,13 @@ class JoystickReader(threading.Thread):
                     if number >= len(self._axes):
                         self._axes.extend([0] * (number + 1 - len(self._axes)))
                     self._axes[number] = value
+                    # The kernel replays each axis once with JS_EVENT_INIT
+                    # set right after open; that value is the rest pose.
+                    if is_init:
+                        if number >= len(self._rest):
+                            self._rest.extend(
+                                [0] * (number + 1 - len(self._rest)))
+                        self._rest[number] = value
             elif kind == JS_EVENT_BUTTON:
                 prev = button_state.get(number, 0)
                 button_state[number] = value
@@ -534,34 +588,48 @@ def _bucket_hz(v: float) -> int:
 
 def integrate_loop(cfg: Config, ik: IkSolver, boards: list[Board],
                    js: JoystickReader, stop_flag: threading.Event):
+    """Velocity-level resolved-rate control.
+
+    Stick deflection -> commanded end-effector linear velocity v (m/s).
+    Damped least squares maps v through the position Jacobian to joint
+    rates: q_dot = J^T (J J^T + lambda^2 I)^-1 v. Those rates become
+    `jog <target> <hz>` directly. At zero deflection q_dot = 0 and every
+    jog is 0 -- there is no pose setpoint to chase, so the arm holds
+    still and small Cartesian moves can't trigger null-space jumps the
+    way per-tick pose IK on a redundant chain did.
+
+    Joint positions are dead-reckoned by integrating the rates we send,
+    purely to give the Jacobian an evaluation point next tick. There is
+    no encoder feedback; the arm is assumed at home_xyz on launch.
+    """
     period = 1.0 / max(10, min(200, cfg.poll_hz))
     dt = period
+    lam = max(1e-6, cfg.cartesian.dls_lambda)
+    vmax = cfg.cartesian.max_speed_xyz
 
-    # Per-driven-joint state: home angle (rad), commanded step position
-    # (steps relative to startup pose), last sent jog hz.
+    # One-time pose IK gives the starting joint configuration that
+    # corresponds to home_xyz; we dead-reckon forward from here.
     home_xyz = cfg.cartesian.home_xyz
-    q_home = ik.solve(home_xyz)
+    q = ik.solve(home_xyz).copy()
     print(f"ik: home_xyz={home_xyz} -> q_home(active)="
-          f"{[round(ik.joint_angle(q_home, j), 4) for j in ik.joint_index]}",
+          f"{[round(ik.joint_angle(q, j), 4) for j in ik.joint_index]}",
           file=sys.stderr)
 
-    # Per board: { stepper_target -> JointMap, sent_steps (float), last_hz (int) }
-    sent_steps: list[dict[str, float]] = [{} for _ in boards]
+    # Driven-joint chain indices, in the order the columns of the
+    # Jacobian / q_dot are produced. col_of maps a URDF joint name to
+    # its column so each [[boards.joints]] entry can find its rate.
+    active = list(ik.joint_index.values())
+    col_of = {name: k for k, name in enumerate(ik.joint_index)}
+    bounds = [ik.chain.links[i].bounds for i in active]
+
+    # Per board: { stepper_target -> last_hz (int) } for jog dedup.
     last_hz: list[dict[str, int]] = [{} for _ in boards]
     for bi, board in enumerate(boards):
         for jm in board.cfg.joints:
-            sent_steps[bi][jm.target] = 0.0
             last_hz[bi][jm.target] = 0
 
     # Passthrough axis bookkeeping (same logic as the Rust host).
     last_passthrough: list[dict[str, tuple[int, int]]] = [{} for _ in boards]
-
-    # Commanded Cartesian target, ramped toward the stick-derived target at
-    # most `max_step_per_tick` meters per tick. Without this the target jumps
-    # the full stick range in one tick, asking the steppers for a six-figure
-    # step rate they can't follow -- they stall and the arm barely moves.
-    cmd_xyz = list(home_xyz)
-    max_step = max(0.0, cfg.cartesian.max_step_per_tick)
 
     next_tick = time.monotonic()
     while not stop_flag.is_set():
@@ -578,49 +646,49 @@ def integrate_loop(cfg: Config, ik: IkSolver, boards: list[Board],
         else:
             axes_snap = js.axes_snapshot()
 
-        # --- Cartesian target from sticks -----------------------------------
+        # --- Commanded EE velocity from sticks ------------------------------
         sx = _stick(axes_snap, cfg.cartesian.axis_x, cfg.cartesian.deadzone,
                     cfg.cartesian.invert_x)
         sy = _stick(axes_snap, cfg.cartesian.axis_y, cfg.cartesian.deadzone,
                     cfg.cartesian.invert_y)
         sz = _stick(axes_snap, cfg.cartesian.axis_z, cfg.cartesian.deadzone,
                     cfg.cartesian.invert_z)
-        desired_xyz = (
-            home_xyz[0] + sx * cfg.cartesian.range_xyz[0],
-            home_xyz[1] + sy * cfg.cartesian.range_xyz[1],
-            home_xyz[2] + sz * cfg.cartesian.range_xyz[2],
-        )
+        v = np.array([sx * vmax[0], sy * vmax[1], sz * vmax[2]])
 
-        # Ramp the commanded target toward the stick target, capping the
-        # per-tick Cartesian step magnitude so end-effector speed (and thus
-        # the joint step rate the firmware is asked for) stays achievable.
-        dvec = [desired_xyz[i] - cmd_xyz[i] for i in range(3)]
-        dist = math.sqrt(sum(d * d for d in dvec))
-        if max_step > 0.0 and dist > max_step:
-            scale = max_step / dist
-            cmd_xyz = [cmd_xyz[i] + dvec[i] * scale for i in range(3)]
+        # --- Resolved-rate: q_dot = J^T (J J^T + lam^2 I)^-1 v --------------
+        if not np.any(v):
+            q_dot = np.zeros(len(active))
         else:
-            cmd_xyz = list(desired_xyz)
-        target_xyz = (cmd_xyz[0], cmd_xyz[1], cmd_xyz[2])
+            try:
+                jac = ik.position_jacobian(q, active)
+                a = jac @ jac.T + lam * lam * np.eye(3)
+                q_dot = jac.T @ np.linalg.solve(a, v)
+            except Exception as e:
+                print(f"ik: jacobian solve failed: {e}", file=sys.stderr)
+                q_dot = np.zeros(len(active))
 
-        # --- IK -------------------------------------------------------------
-        try:
-            q_target = ik.solve(target_xyz)
-        except Exception as e:
-            print(f"ik: solve failed at {target_xyz}: {e}", file=sys.stderr)
-            continue
+        # Integrate dead-reckoned q forward, clamping at joint limits. When
+        # a joint is pinned at a bound, the effective rate we send is the
+        # clamped delta / dt so the firmware and our bookkeeping agree.
+        eff_rate = np.zeros(len(active))
+        for k, idx in enumerate(active):
+            q_new = q[idx] + q_dot[k] * dt
+            lo, hi = bounds[k]
+            if math.isfinite(lo) and q_new < lo:
+                q_new = lo
+            elif math.isfinite(hi) and q_new > hi:
+                q_new = hi
+            eff_rate[k] = (q_new - q[idx]) / dt
+            q[idx] = q_new
 
         # --- Per-board jog dispatch for IK joints --------------------------
         for bi, board in enumerate(boards):
             for jm in board.cfg.joints:
                 if jm.target not in AXIS_TOKENS:
                     continue
-                dq = ik.joint_angle(q_target, jm.joint) - \
-                    ik.joint_angle(q_home, jm.joint)
-                target_steps = dq * jm.steps_per_rad * (-1.0 if jm.invert else 1.0)
-                err_steps = target_steps - sent_steps[bi][jm.target]
-                vel_hz_float = err_steps / dt
-                vel_hz = _bucket_hz(vel_hz_float)
+                rate = eff_rate[col_of[jm.joint]]
+                hz_float = rate * jm.steps_per_rad * (-1.0 if jm.invert else 1.0)
+                vel_hz = _bucket_hz(hz_float)
                 prev = last_hz[bi][jm.target]
                 # Idle -> idle: nothing to send. The firmware's deadman
                 # watchdog will halt motion if a nonzero jog stops being
@@ -628,11 +696,6 @@ def integrate_loop(cfg: Config, ik: IkSolver, boards: list[Board],
                 if vel_hz == 0 and prev == 0:
                     continue
                 last_hz[bi][jm.target] = vel_hz
-                # Step-count bookkeeping is integrated from the bucketed
-                # rate we *actually* send, not the float velocity, so the
-                # host's notion of position matches what the firmware was
-                # told to do.
-                sent_steps[bi][jm.target] += vel_hz * dt
                 send(board, f"jog {jm.target} {vel_hz}\r\n", cfg.log)
 
             # --- Passthrough axes (non-IK DOFs) -----------------------------
