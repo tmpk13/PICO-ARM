@@ -6,11 +6,16 @@
 # them, so you can split joystick controls between boards however you
 # like (e.g. left stick on board A, right stick on board B).
 #
-# Each [[boards.axes]] block maps one joystick axis (index N on
-# /dev/input/jsN) to one stepper axis on that board. At full deflection
-# the firmware will be commanded `jog <target> <+- sensitivity>` (in
-# steps/sec). Inside the deadzone the axis is treated as zero (and the
-# firmware is told to stop).
+# Each [[boards.axes]] block maps one or more joystick axes to one
+# stepper axis on that board. At full deflection the firmware will be
+# commanded `jog <target> <+- sensitivity>` (in steps/sec). Inside the
+# deadzone the axis is treated as zero (and the firmware is told to stop).
+#
+# `index` accepts either a single joystick axis (`index = 3`) or a list
+# (`index = [3, 5]`). With a list every axis drives the same target: each
+# is deadzoned/inverted independently, then their deflections are summed
+# and clamped, so any of the sticks moves the joint and opposing sticks
+# cancel.
 #
 # Each [[boards.buttons]] block sends a single one-shot `move` on press.
 
@@ -70,55 +75,72 @@ name   = "main"
 [[boards.axes]]
 index           = 3
 target          = "x"
-sensitivity     = 5000
+sensitivity     = 10000
 deadzone        = 0.20
 invert          = false
-accel           = 4000
+accel           = 5000
 microsteps      = 16
-run_current_ma  = 800
-hold_current_ma = 400
+run_current_ma  = 2000
+hold_current_ma = 0
 hold_delay      = 8
 spreadcycle     = false
 interpolate     = true
 
-# y == Joint 2 (Middle)
-[[boards.axes]]
-index           = 1
-target          = "y"
-sensitivity     = 2000
-deadzone        = 0.20
-invert          = true
-accel           = 3000
-microsteps      = 16
-run_current_ma  = 800
-hold_current_ma = 400
-hold_delay      = 8
-spreadcycle     = false
-interpolate     = true
+# # # y == Joint 2 (Middle)
+# [[boards.axes]]
+# index           = 5
+# target          = "y"
+# sensitivity     = 2000
+# deadzone        = 0.20
+# invert          = true
+# accel           = 3000
+# microsteps      = 16
+# run_current_ma  = 800
+# hold_current_ma = 400
+# hold_delay      = 8
+# spreadcycle     = false
+# interpolate     = true
 
-# z == Joint 3 (End)
-[[boards.axes]]
-index           = 1
-target          = "z"
-sensitivity     = 2000
-deadzone        = 0.20
-invert          = true
-accel           = 3000
-microsteps      = 16
-run_current_ma  = 800
-hold_current_ma = 400
-hold_delay      = 8
-spreadcycle     = false
-interpolate     = true
+# # z == Joint 3 (End)
+# [[boards.axes]]
+# index           = 1
+# target          = "z"
+# sensitivity     = 2000
+# deadzone        = 0.20
+# invert          = true
+# accel           = 3000
+# microsteps      = 16
+# run_current_ma  = 800
+# hold_current_ma = 400
+# hold_delay      = 8
+# spreadcycle     = false
+# interpolate     = true
+
+# # e == Joint 1 (Bottom)
+# [[boards.axes]]
+# index           = 2
+# target          = "e"
+# sensitivity     = 2000
+# deadzone        = 0.10
+# invert          = false
+# accel           = 2000
+# microsteps      = 16
+# run_current_ma  = 600
+# hold_current_ma = 300
+# hold_delay      = 8
+# spreadcycle     = false
+# interpolate     = true
+
+
 
 # e == Joint 1 (Bottom)
 [[boards.axes]]
-index           = 2
+index           = 1
 target          = "e"
 sensitivity     = 2000
 deadzone        = 0.10
 invert          = false
-accel           = 2000
+accel           = 1000
 microsteps      = 16
 run_current_ma  = 600
 hold_current_ma = 300
@@ -126,16 +148,50 @@ hold_delay      = 8
 spreadcycle     = false
 interpolate     = true
 
+# y == Joint 2 (Middle)
+[[boards.axes]]
+index           = [1, 4]
+target          = "y"
+sensitivity     = 2000
+deadzone        = 0.20
+invert          = false
+accel           = 1000
+microsteps      = 16
+run_current_ma  = 800
+hold_current_ma = 400
+hold_delay      = 8
+spreadcycle     = false
+interpolate     = true
+
+
+[[boards.axes]]
+index           = 5
+target          = "z"
+sensitivity     = 2000
+deadzone        = 0.20
+invert          = true
+accel           = 1000
+microsteps      = 16
+run_current_ma  = 800
+hold_current_ma = 400
+hold_delay      = 8
+spreadcycle     = false
+interpolate     = true
+
+
+
+
+
 # # e == Joint 1 (Bottom)
 # [[boards.buttons]]
 # index  = 2
-# target = "e"
+# target = "z"
 # delta  = 10000
 # hz     = 1000
 # # e == Joint 1
 # [[boards.buttons]]
 # index  = 3
-# target = "e"
+# target = "z"
 # delta  = -10000
 # hz     = 1000
 
@@ -226,24 +282,24 @@ invert      = false
 accel       = 1500
 
 # End effector pivot
-[[boards.axes]]
-index       = 4
-target      = "z"
-sensitivity = 500
-deadzone    = 0.10
-invert      = false
-accel       = 1500
+# [[boards.axes]]
+# index       = 4
+# target      = "z"
+# sensitivity = 500
+# deadzone    = 0.10
+# invert      = false
+# accel       = 1500
 
 # End effector wrist
-[[boards.axes]]
-index       = 5
-target      = "e"
-sensitivity = 200
-deadzone    = 0.10
-invert      = false
-accel       = 200
-run_current_ma  = 100
-hold_current_ma = 10
+# [[boards.axes]]
+# index       = 5
+# target      = "e"
+# sensitivity = 200
+# deadzone    = 0.10
+# invert      = false
+# accel       = 200
+# run_current_ma  = 100
+# hold_current_ma = 10
 
 [[boards.fans]]
 index  = 0

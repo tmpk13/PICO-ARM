@@ -23,19 +23,27 @@ safe_stop_on_exit = true
 # ---- URDF + IK chain ----------------------------------------------------
 #
 # URDF path is relative to this config file.
-urdf = "pico-arm/urdf/assembly_1.urdf"
+urdf = "pico_arm/urdf/pico_arm.urdf"
 
 # ikpy traverses the URDF tree with a hand-written ordered list of
 # alternating joint/link names. base_type = "joint" means the first
-# entry is a joint name (here we want base_rotation to be part of the
-# chain because a stepper drives it). The chain ends at the link
-# whose pose we want IK to hit -- here part_24, the end of the
-# end-effector linkage.
+# entry is a joint name. In this URDF the base is rigid -- root is
+# fixed all the way to main_linkage_body (no base yaw joint) -- so the
+# chain begins with the two fixed joints that get us to the first
+# driven link.
+#
+# The list below stops at stepper_body_2, but ikpy auto-extends past the
+# last listed element to the tree leaf -- so the wrist pivot revolute_1
+# and its child small_motor_coupler are still pulled into the chain, and
+# small_motor_coupler is the frame IK actually reaches. That is fine:
+# revolute_1 is NOT in active_joints, so the solver holds it fixed (see
+# the driven-only active mask in IkSolver). Only the three main linkage
+# joints are IK degrees of freedom; the wrist does not move.
 chain_base_type = "joint"
 chain_elements  = [
-  "base_rotation",                # joint, continuous
-  "base",                         # link
-  "base_mount",                   # joint, fixed
+  "fastened_4",                   # joint, fixed (root -> part_30)
+  "part_30",                      # link
+  "fastened_3",                   # joint, fixed (part_30 -> body)
   "main_linkage_body",            # link
   "linkage_1_rotation",           # joint, revolute (driven)
   "main_linkage_coupler_long",    # link
@@ -49,22 +57,19 @@ chain_elements  = [
   "main_linkage_coupler_long_2",  # link
   "left_coupler_mount__3_",       # joint, fixed
   "main_linkage_end",             # link
-  "end_effector_attachment",      # joint, fixed
-  "part_23",                      # link
-  "revolute_1",                   # joint, continuous (held, not IK-driven)
-  "part_24",                      # link, IK target frame
+  "fastened_1",                   # joint, fixed
+  "part_29",                      # link
+  "fastened_2",                   # joint, fixed
+  "stepper_body_2",               # link, IK target frame
 ]
 
 # Subset of the joints above that IK should solve and that the host
 # will index into when reading the solution vector. Must match the
 # `joint` field of every [[boards.joints]] entry below.
-# Only the base and the three main linkage joints are IK-driven. That is
-# 4 joints for a 3-DOF position target -- one redundant DOF, which DLS
-# resolves fine. revolute_1 (the end-effector pivot) stays in the chain
-# below so IK still reaches part_24, but it is held at its home value,
-# not solved.
+# The base is rigid in this URDF and the wrist pivot is out of the chain,
+# so only the three main linkage joints are IK-driven. That is 3 joints
+# for a 3-DOF position target -- exactly determined.
 active_joints = [
-  "base_rotation",
   "linkage_1_rotation",
   "linkage_2_rotation",
   "linkage_3_rotation",
@@ -78,8 +83,17 @@ active_joints = [
 # every joint rate is 0, so the arm holds still -- there is no pose
 # setpoint to chase.
 #
-# home_xyz       starting EE pose (m, URDF root frame); the arm is
-#                assumed parked here at launch (no encoders).
+# home_joints    assumed joint configuration at launch, { joint -> degrees }.
+#                The arm is taken to be parked exactly here -- the host
+#                seeds its dead-reckoned joint state from these angles (no
+#                IK solve) and commands zero motion until a stick deflects,
+#                so nothing moves out of the gate. Park the arm in this pose
+#                before launching. May also pin any held (non-driven) joint
+#                that is part of the chain, if one is ever added back.
+#                Preferred over home_xyz; if present, home_xyz is ignored.
+# home_xyz       legacy fallback used only when home_joints is absent:
+#                starting EE pose (m, URDF root frame) from which one-time
+#                IK derives the start configuration.
 # max_speed_xyz  EE linear speed at full stick deflection, per axis (m/s).
 #                Start small and loosen once motion looks sane.
 # dls_lambda     damped-least-squares damping. Larger = robust near
@@ -95,7 +109,6 @@ active_joints = [
 # latter is omitted; it is otherwise unused in velocity mode.
 
 [cartesian]
-home_xyz      = [0.0, -0.10, 0.10]   # meters in URDF root frame
 range_xyz     = [0.4, 0.4, 0.6]
 max_speed_xyz = [0.08, 0.08, 0.08]   # m/s at full deflection
 dls_lambda    = 0.05
@@ -106,6 +119,79 @@ deadzone = 0.20
 invert_x = false
 invert_y = false
 invert_z = false
+
+# Assumed home pose, in joint degrees. Defaults below sit mid-range within
+# each joint's URDF limit -- adjust to the pose you actually park the arm
+# in before launch.
+[cartesian.home_joints]
+linkage_1_rotation = 65.0    # limit  20 .. 110 deg
+linkage_2_rotation = -60.0   # limit -140 ..  20 deg
+linkage_3_rotation = 40.0    # limit  -40 .. 120 deg
+
+# ---- AS5600 encoder feedback (optional) --------------------------------
+#
+# The firmware-sensors RP2040 board streams four AS5600 magnetic encoder
+# angles as CSV (`a0,a1,a2,a3`, degrees) over its own USB-CDC serial port.
+# When this [sensors] block is present and enabled, ik-host reads those
+# angles every tick and uses them as the real joint state for the IK
+# Jacobian -- closing the dead-reckoning loop, so the arm no longer has to
+# start parked at home_xyz (for any joint that has a live encoder).
+#
+# Each [[sensors.encoders]] binds one CSV channel (a0..a3 -> channel 0..3)
+# to a URDF joint named in `active_joints` above. Conversion:
+#
+#     joint_deg = (raw_deg - offset_deg) / scale   (negated if invert)
+#
+# wrapped to (-180, 180] and converted to radians.
+#
+#   offset_deg  raw AS5600 reading (0..360) when the joint sits at angle 0.
+#               Park the joint at its zero, read the CSV stream (e.g.
+#               `screen /dev/ttyACM* 115200`), and copy the value here.
+#               Ignored when zero_at_home = true (see below).
+#   invert      flip sense if the encoder counts opposite the URDF axis.
+#   scale       encoder-degrees per joint-degree (gear ratio). 1.0 when the
+#               magnet sits directly on the joint axis.
+#
+# zero_at_home  when true, each encoder's offset_deg is recaptured at launch
+#               so its reading maps to the joint's home angle (from
+#               [cartesian.home_joints]). Park the arm at home, start the
+#               host, and "here" becomes home -- no manual offset_deg
+#               calibration, and the feedback agrees with the assumed start
+#               pose so the arm does not twitch on the first tick.
+#
+# A channel that reads NaN, or a stale stream (board unplugged), falls back
+# to dead reckoning for that joint. Set enabled = false to ignore the board
+# without deleting this block.
+
+[sensors]
+# firmware-sensors USB CDC port. Verify with `ls /dev/serial/by-id/`.
+serial       = "/dev/serial/by-id/usb-imitation-training_Sensor_CSV_Stream_firmware-sensors-if00"
+enabled      = true
+zero_at_home = true
+
+# Base is rigid in this URDF -- no base_rotation joint/encoder. The
+# three encoders below feed the three IK-driven linkage joints. (CSV
+# channel 0 is unused unless you wire an encoder to another joint.)
+[[sensors.encoders]]
+channel    = 1
+joint      = "linkage_1_rotation"
+offset_deg = 0.0
+invert     = false
+scale      = 1.0
+
+[[sensors.encoders]]
+channel    = 2
+joint      = "linkage_2_rotation"
+offset_deg = 0.0
+invert     = false
+scale      = 1.0
+
+[[sensors.encoders]]
+channel    = 3
+joint      = "linkage_3_rotation"
+offset_deg = 0.0
+invert     = false
+scale      = 1.0
 
 # ---- board 0 -----------------------------------------------------------
 
@@ -121,19 +207,9 @@ name   = "main"
 #
 # TMC fields are identical to config.toml.
 
-# x stepper drives base_rotation
-[[boards.joints]]
-target          = "x"
-joint           = "base_rotation"
-steps_per_rad   = 5093     # 200 full steps * 16 ustep * gear_ratio / (2*pi)
-invert          = false
-accel           = 4000
-microsteps      = 16
-run_current_ma  = 800
-hold_current_ma = 400
-hold_delay      = 8
-spreadcycle     = false
-interpolate     = true
+# The base is rigid in this URDF (no base_rotation joint), so the x
+# stepper is no longer IK-driven. Add a [[boards.axes]] entry for it if
+# you want manual stick control of that motor.
 
 # e stepper drives linkage_1_rotation (Joint 1 / bottom)
 [[boards.joints]]
@@ -188,11 +264,10 @@ mode = "toggle"
 serial = "/dev/serial/by-id/usb-tmc-new-era_SKR_Pico_Stepper_CLI_5044340408D1B41C-if00"
 name   = "aux"
 
-# revolute_1 (end-effector pivot, aux z stepper) is no longer IK-driven:
-# only the base and three main joints are. The pivot is held at its home
-# value by IK. The z stepper here is therefore left unwired -- add a
-# [[boards.axes]] entry for it if you want manual stick control of the
-# wrist.
+# revolute_1 (end-effector pivot, aux z stepper) is not in the IK chain
+# at all -- only the three main linkage joints are IK-driven. The z
+# stepper here is therefore left unwired -- add a [[boards.axes]] entry
+# for it if you want manual stick control of the wrist.
 
 # Wrist and gripper aren't in the IK chain -- keep the old
 # stick-velocity mapping for them via [[boards.axes]] (same fields as

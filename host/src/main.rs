@@ -77,10 +77,31 @@ struct BoardConfig {
     servo_buttons: Vec<ServoButtonMap>,
 }
 
+/// One or more joystick axis indices. Accepts either a bare integer
+/// (`index = 3`) or an array (`index = [3, 5]`) in the TOML, so a single
+/// stepper target can be driven by several sticks at once.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+enum Indices {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl Indices {
+    fn as_slice(&self) -> &[usize] {
+        match self {
+            Indices::One(i) => std::slice::from_ref(i),
+            Indices::Many(v) => v.as_slice(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, Clone)]
 struct AxisMap {
-    /// Joystick axis index (`/dev/input/js0` numbering).
-    index: usize,
+    /// Joystick axis index(es) (`/dev/input/js0` numbering). A single
+    /// integer drives the target from one stick; an array (`[3, 5]`) sums
+    /// the deflection of several sticks so they all move the same target.
+    index: Indices,
     /// Stepper axis: x | y | z | e | none.
     target: String,
     /// Max signed steps/sec at full deflection.
@@ -531,19 +552,26 @@ fn integrate_loop(
             let link = &links[board_idx];
             for map in &board.axes {
                 let Some(target) = axis_token(&map.target) else { continue };
-                let raw = match axes_state.get(map.index) {
-                    Some(v) => *v as f32 / JS_MAX,
-                    None => 0.0,
-                };
-                let raw = if map.invert { -raw } else { raw };
                 let dz = map.deadzone.clamp(0.0, 0.95);
-                let mag = raw.abs();
-                let signed_v = if mag < dz {
-                    0.0
-                } else {
-                    let norm = (mag - dz) / (1.0 - dz) * raw.signum();
-                    norm * map.sensitivity
-                };
+                // Combine every joystick axis bound to this target: each
+                // index is deadzoned and inverted independently, then the
+                // normalized [-1,1] deflections are summed and clamped. With
+                // a single index this is identical to the old behaviour;
+                // with several, any of them moves the target and opposing
+                // sticks cancel.
+                let mut norm = 0.0f32;
+                for &idx in map.index.as_slice() {
+                    let raw = match axes_state.get(idx) {
+                        Some(v) => *v as f32 / JS_MAX,
+                        None => 0.0,
+                    };
+                    let raw = if map.invert { -raw } else { raw };
+                    let mag = raw.abs();
+                    if mag >= dz {
+                        norm += (mag - dz) / (1.0 - dz) * raw.signum();
+                    }
+                }
+                let signed_v = norm.clamp(-1.0, 1.0) * map.sensitivity;
 
                 let (new_sign, new_mag): (i32, u32) = if signed_v.abs() < 1.0 {
                     (0, 0)

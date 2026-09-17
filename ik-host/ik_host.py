@@ -9,10 +9,17 @@ Cartesian-space input.
   pixi run python ik_host.py                  # uses ../config-ik.toml
   pixi run python ik_host.py path/to/cfg.toml
 
-The arm is assumed to be at `cartesian.home_xyz` when this starts.
-There is no encoder feedback -- jog rates are integrated forward from
-that assumed start pose, so a fresh launch with the arm in some other
-pose will be wrong by the offset.
+The arm is assumed to be parked at its home pose when this starts, and
+jog rates are integrated forward from there. Set the home pose in the
+config: `cartesian.home_joints` (joint name -> degrees) pins each joint
+directly and is preferred; `cartesian.home_xyz` is the legacy fallback
+that derives the pose via one-time IK. Control is velocity-level, so at
+zero stick deflection every jog is 0 -- the arm does not move at launch.
+
+With AS5600 feedback, set `sensors.zero_at_home = true` to recapture the
+encoder offsets at launch so the current reading maps to home: wherever
+the arm physically sits when the host starts is declared home, and the
+feedback agrees with the assumed pose instead of snapping to it.
 
 Stops cleanly on Ctrl-C: sends `jog * 0` and `disable all` to every
 board before exiting.
@@ -48,6 +55,11 @@ JS_EVENT_AXIS = 0x02
 JS_EVENT_INIT = 0x80
 JS_MAX = 32767.0
 AXIS_TOKENS = {"x", "y", "z", "e"}
+
+# AS5600 encoder feedback (firmware-sensors CSV stream) is considered valid
+# only if a frame arrived within this many seconds; otherwise the affected
+# joints fall back to dead reckoning.
+SENSOR_STALE_SEC = 0.5
 
 # -----------------------------------------------------------------------------
 # Config
@@ -97,6 +109,40 @@ class FanMap:
 
 
 @dataclass
+class EncoderMap:
+    """Binds one AS5600 channel from the firmware-sensors CSV stream
+    (`a0,a1,a2,a3`, degrees) to a URDF joint. The raw 0..360 reading is
+    converted to a joint angle in radians as:
+
+        joint_deg = (raw_deg - offset_deg) / scale   (then optionally negated)
+
+    wrapped to (-180, 180]. `offset_deg` is the raw reading when the joint
+    is at its zero; tune it until the host's reported angle matches the real
+    joint. `scale` is encoder-degrees per joint-degree (gear ratio; 1.0 for a
+    sensor on the joint axis). `invert` flips the sense to match the URDF axis.
+    """
+
+    channel: int
+    joint: str
+    offset_deg: float = 0.0
+    invert: bool = False
+    scale: float = 1.0
+
+
+@dataclass
+class SensorCfg:
+    serial: str
+    encoders: list["EncoderMap"] = field(default_factory=list)
+    enabled: bool = True
+    # When true, each encoder's offset_deg is recaptured at startup so the
+    # reading taken the moment the host launches maps to the home joint
+    # angle. In other words, wherever the arm physically sits at launch is
+    # declared "home" -- the manual offset_deg values are ignored. Leave
+    # false to use the hand-calibrated offset_deg instead.
+    zero_at_home: bool = False
+
+
+@dataclass
 class BoardConfig:
     serial: str
     name: str | None = None
@@ -107,7 +153,6 @@ class BoardConfig:
 
 @dataclass
 class CartesianCfg:
-    home_xyz: tuple[float, float, float]
     range_xyz: tuple[float, float, float]
     axis_x: int
     axis_y: int
@@ -124,6 +169,17 @@ class CartesianCfg:
     # near singularities but more tracking error; smaller = crisper but
     # twitchy at workspace edges.
     dls_lambda: float = 0.05
+    # Assumed joint configuration at startup: { joint_name -> radians }.
+    # When present this is the home pose -- the host seeds its dead-reckoned
+    # joint state directly from it (no IK solve), so the arm assumes it is
+    # parked exactly here and commands zero motion until a stick deflects.
+    # Preferred over home_xyz, which only fixes the EE position and leaves
+    # the held joints wherever IK happens to land.
+    home_joints: dict[str, float] | None = None
+    # Legacy/optional: EE position (m) the arm is assumed parked at. Used
+    # to seed the joint state via one-time IK only when home_joints is
+    # absent. May be None when home_joints is supplied.
+    home_xyz: tuple[float, float, float] | None = None
 
 
 @dataclass
@@ -139,6 +195,7 @@ class Config:
     log: bool = False
     enable_on_start: bool = True
     safe_stop_on_exit: bool = True
+    sensors: SensorCfg | None = None
 
 
 def _opt(d: dict, key: str, default: Any) -> Any:
@@ -156,8 +213,19 @@ def load_config(path: Path) -> Config:
     range_xyz = tuple(cart_raw["range_xyz"])
     ms = _opt(cart_raw, "max_speed_xyz", range_xyz)
     max_speed = (float(ms[0]), float(ms[1]), float(ms[2]))
+    # Home pose. home_joints (joint name -> degrees) is preferred and is
+    # converted to radians here; home_xyz stays optional for back-compat.
+    hj_raw = cart_raw.get("home_joints")
+    home_joints = None
+    if hj_raw is not None:
+        home_joints = {str(k): math.radians(float(v)) for k, v in hj_raw.items()}
+    hx_raw = cart_raw.get("home_xyz")
+    home_xyz = ((float(hx_raw[0]), float(hx_raw[1]), float(hx_raw[2]))
+                if hx_raw is not None else None)
+    if home_joints is None and home_xyz is None:
+        raise ValueError(
+            "[cartesian] needs home_joints (joint->deg) or home_xyz")
     cart = CartesianCfg(
-        home_xyz=tuple(cart_raw["home_xyz"]),
         range_xyz=range_xyz,
         axis_x=int(cart_raw["axis_x"]),
         axis_y=int(cart_raw["axis_y"]),
@@ -168,6 +236,8 @@ def load_config(path: Path) -> Config:
         invert_z=bool(_opt(cart_raw, "invert_z", False)),
         max_speed_xyz=max_speed,
         dls_lambda=float(_opt(cart_raw, "dls_lambda", 0.05)),
+        home_joints=home_joints,
+        home_xyz=home_xyz,
     )
 
     boards = []
@@ -225,6 +295,26 @@ def load_config(path: Path) -> Config:
     if not boards:
         raise ValueError("config has no [[boards]] entries")
 
+    sensors = None
+    sraw = raw.get("sensors")
+    if sraw is not None:
+        encoders = [
+            EncoderMap(
+                channel=int(e["channel"]),
+                joint=e["joint"],
+                offset_deg=float(_opt(e, "offset_deg", 0.0)),
+                invert=bool(_opt(e, "invert", False)),
+                scale=float(_opt(e, "scale", 1.0)),
+            )
+            for e in sraw.get("encoders", [])
+        ]
+        sensors = SensorCfg(
+            serial=sraw["serial"],
+            encoders=encoders,
+            enabled=bool(_opt(sraw, "enabled", True)),
+            zero_at_home=bool(_opt(sraw, "zero_at_home", False)),
+        )
+
     return Config(
         device=raw["device"],
         urdf=raw["urdf"],
@@ -237,7 +327,38 @@ def load_config(path: Path) -> Config:
         log=bool(_opt(raw, "log", False)),
         enable_on_start=bool(_opt(raw, "enable_on_start", True)),
         safe_stop_on_exit=bool(_opt(raw, "safe_stop_on_exit", True)),
+        sensors=sensors,
     )
+
+
+# -----------------------------------------------------------------------------
+# AS5600 encoder math
+# -----------------------------------------------------------------------------
+
+
+def encoder_rad(raw_deg: float, enc: EncoderMap) -> float:
+    """Raw AS5600 reading (degrees, 0..360) -> joint angle in radians.
+
+    Applies the configured zero offset, gear scale, and sense inversion, then
+    wraps to (-180, 180] before converting to radians.
+    """
+    a = raw_deg - enc.offset_deg
+    if enc.scale:
+        a /= enc.scale
+    if enc.invert:
+        a = -a
+    a = ((a + 180.0) % 360.0) - 180.0
+    return math.radians(a)
+
+
+def offset_for_home(raw_deg: float, home_rad: float, enc: EncoderMap) -> float:
+    """Solve for the offset_deg that makes encoder_rad(raw_deg, enc) equal
+    home_rad. Used by zero-at-home: the reading captured at launch is
+    declared to correspond to the home joint angle, so the encoder feedback
+    agrees with the assumed start pose and can't yank the arm on tick 1."""
+    home_deg = math.degrees(home_rad)
+    pre = -home_deg if enc.invert else home_deg
+    return raw_deg - enc.scale * pre
 
 
 # -----------------------------------------------------------------------------
@@ -279,10 +400,13 @@ def _patch_continuous_joints(src: Path) -> Path:
 class IkSolver:
     """Wraps an ikpy Chain plus the joint-name -> chain-index lookup.
 
-    The active joints we care about (the ones driven by steppers) are
-    a strict subset of chain.active_links_mask -- ikpy's mask flags
-    every revolute/continuous/prismatic joint as active, including
-    ones we want to hold constant. We post-mask by joint name.
+    Only the driven joints (the ones listed in active_joints / bound to
+    steppers) are IK degrees of freedom. ikpy auto-extends the chain past
+    the last listed element to the tree leaf, so non-driven moving joints
+    (e.g. the wrist pivot revolute_1) can still appear in the chain. We
+    build the active_links_mask from the driven set alone, so every other
+    joint -- fixed or merely undriven -- is held at its seed value and the
+    solver never moves it.
     """
 
     def __init__(self, urdf_path: Path, elements: list[str], base_type: str,
@@ -292,16 +416,17 @@ class IkSolver:
         # generous +/-2*pi limit so the optimizer's bound-aware path
         # still works.
         patched_urdf = _patch_continuous_joints(urdf_path)
-        # Build the chain once with default mask, then pass it back in
-        # with fixed links marked inactive so ikpy stops warning that
-        # they can't contribute (and so the active-bounds match the
-        # set of joints we actually solve for).
+        # Build the chain once to discover its links, then rebuild with an
+        # active mask that flags ONLY the driven joints. Holding every
+        # other joint (including undriven moving ones like the wrist pivot)
+        # keeps the IK exactly N-DOF for N driven joints.
+        driven_set = set(driven_joints)
         first = Chain.from_urdf_file(
             str(patched_urdf),
             base_elements=elements,
             base_element_type=base_type,
         )
-        mask = [link.joint_type != "fixed" for link in first.links]
+        mask = [link.name in driven_set for link in first.links]
         chain = Chain.from_urdf_file(
             str(patched_urdf),
             base_elements=elements,
@@ -347,6 +472,22 @@ class IkSolver:
 
     def joint_angle(self, sol: np.ndarray, joint: str) -> float:
         return float(sol[self.joint_index[joint]])
+
+    def seed_vector(self) -> np.ndarray:
+        """Full-length joint vector seeded at each joint's bounds midpoint
+        (fixed links stay 0). Use as the starting point when building a
+        home pose directly in joint space."""
+        return self._seed.copy()
+
+    def link_index(self, name: str) -> int:
+        """Chain index of a link/joint by name. Unlike joint_index this
+        also resolves held (non-driven) joints such as the wrist pivot,
+        so a home pose can pin them too."""
+        for i, link in enumerate(self.chain.links):
+            if link.name == name:
+                return i
+        names = ", ".join(link.name for link in self.chain.links)
+        raise ValueError(f"joint {name!r} not in URDF chain (chain: {names})")
 
     def ee_position(self, q: np.ndarray) -> np.ndarray:
         """End-effector position (xyz) for a full joint vector q."""
@@ -482,6 +623,91 @@ class JoystickReader(threading.Thread):
 
 
 # -----------------------------------------------------------------------------
+# AS5600 encoder reader (firmware-sensors CSV stream)
+# -----------------------------------------------------------------------------
+
+
+class SensorReader(threading.Thread):
+    """Background thread that reads the firmware-sensors CSV stream from its
+    own USB-CDC serial port and exposes the latest raw AS5600 angles.
+
+    The firmware emits one line per frame, `a0,a1,a2,a3\\r\\n`, where each
+    field is an angle in degrees (or `NaN` for a bus that has never read).
+    It only streams -- it does not answer the `version` handshake -- so this
+    is a separate port from the stepper boards. Reconnects on failure.
+    """
+
+    def __init__(self, port_path: str, n_channels: int = 4):
+        super().__init__(name="sensor-reader", daemon=True)
+        self.port_path = port_path
+        self.n = n_channels
+        self._lock = threading.Lock()
+        self._raw: list[float] = [math.nan] * n_channels
+        self._stamp = 0.0  # monotonic time of the last good frame
+        self.connected = False
+        self._stop = threading.Event()
+
+    def stop(self):
+        self._stop.set()
+
+    def snapshot(self) -> tuple[list[float], float]:
+        """Return (raw angles in degrees, monotonic timestamp of last frame)."""
+        with self._lock:
+            return list(self._raw), self._stamp
+
+    def run(self):
+        warned = False
+        while not self._stop.is_set():
+            try:
+                port = serial.Serial(self.port_path, 115200, timeout=0.5)
+            except Exception as e:
+                if not warned:
+                    print(f"sensors: cannot open {self.port_path} ({e}); "
+                          f"retrying", file=sys.stderr)
+                    warned = True
+                time.sleep(1.0)
+                continue
+            print(f"sensors: connected {self.port_path}", file=sys.stderr)
+            self.connected = True
+            warned = False
+            try:
+                self._read_loop(port)
+            except Exception as e:
+                print(f"sensors: read error: {e}", file=sys.stderr)
+            finally:
+                try:
+                    port.close()
+                except Exception:
+                    pass
+                self.connected = False
+                with self._lock:
+                    self._raw = [math.nan] * self.n
+                print("sensors: disconnected, will retry", file=sys.stderr)
+                time.sleep(0.3)
+
+    def _read_loop(self, port: serial.Serial):
+        while not self._stop.is_set():
+            line = port.readline()
+            if not line:
+                continue  # read timeout; loop back to check the stop flag
+            text = line.decode("ascii", errors="ignore").strip()
+            if not text:
+                continue
+            parts = text.split(",")
+            if len(parts) < self.n:
+                continue
+            vals: list[float] = []
+            for p in parts[: self.n]:
+                try:
+                    vals.append(float(p.strip()))  # float("NaN") is valid
+                except ValueError:
+                    vals.append(math.nan)
+            with self._lock:
+                self._raw = vals
+                self._stamp = time.monotonic()
+
+
+# -----------------------------------------------------------------------------
 # Serial: writer + drainer threads per board. Same shape as Rust host.
 # -----------------------------------------------------------------------------
 
@@ -587,7 +813,8 @@ def _bucket_hz(v: float) -> int:
 
 
 def integrate_loop(cfg: Config, ik: IkSolver, boards: list[Board],
-                   js: JoystickReader, stop_flag: threading.Event):
+                   js: JoystickReader, stop_flag: threading.Event,
+                   sensor: SensorReader | None = None):
     """Velocity-level resolved-rate control.
 
     Stick deflection -> commanded end-effector linear velocity v (m/s).
@@ -599,21 +826,39 @@ def integrate_loop(cfg: Config, ik: IkSolver, boards: list[Board],
     way per-tick pose IK on a redundant chain did.
 
     Joint positions are dead-reckoned by integrating the rates we send,
-    purely to give the Jacobian an evaluation point next tick. There is
-    no encoder feedback; the arm is assumed at home_xyz on launch.
+    purely to give the Jacobian an evaluation point next tick. When an
+    AS5600 SensorReader is supplied, each tick first overwrites the driven
+    joints with their measured angles so the Jacobian is evaluated at the
+    real pose -- closing the loop and removing the home_xyz assumption for
+    any joint with a live encoder. Channels that read NaN or go stale fall
+    back to dead reckoning.
     """
     period = 1.0 / max(10, min(200, cfg.poll_hz))
     dt = period
     lam = max(1e-6, cfg.cartesian.dls_lambda)
     vmax = cfg.cartesian.max_speed_xyz
 
-    # One-time pose IK gives the starting joint configuration that
-    # corresponds to home_xyz; we dead-reckon forward from here.
-    home_xyz = cfg.cartesian.home_xyz
-    q = ik.solve(home_xyz).copy()
-    print(f"ik: home_xyz={home_xyz} -> q_home(active)="
-          f"{[round(ik.joint_angle(q, j), 4) for j in ik.joint_index]}",
-          file=sys.stderr)
+    # Starting joint configuration -- the arm is assumed to be parked
+    # exactly here at launch, and we dead-reckon forward from it. Prefer an
+    # explicit joint-space home (cartesian.home_joints): no IK solve, every
+    # joint pinned where we say it is. Fall back to one-time IK on home_xyz
+    # for back-compat. Either way the first tick commands zero motion (the
+    # resolved-rate law sends 0 at zero stick deflection), so nothing moves
+    # out of the gate.
+    if cfg.cartesian.home_joints is not None:
+        q = ik.seed_vector()
+        for jname, ang in cfg.cartesian.home_joints.items():
+            q[ik.link_index(jname)] = ang
+        print(f"ik: home_joints -> q_home(active)="
+              f"{[round(ik.joint_angle(q, j), 4) for j in ik.joint_index]}",
+              file=sys.stderr)
+    else:
+        home_xyz = cfg.cartesian.home_xyz
+        assert home_xyz is not None  # load_config requires one or the other
+        q = ik.solve(home_xyz).copy()
+        print(f"ik: home_xyz={home_xyz} -> q_home(active)="
+              f"{[round(ik.joint_angle(q, j), 4) for j in ik.joint_index]}",
+              file=sys.stderr)
 
     # Driven-joint chain indices, in the order the columns of the
     # Jacobian / q_dot are produced. col_of maps a URDF joint name to
@@ -631,6 +876,42 @@ def integrate_loop(cfg: Config, ik: IkSolver, boards: list[Board],
     # Passthrough axis bookkeeping (same logic as the Rust host).
     last_passthrough: list[dict[str, tuple[int, int]]] = [{} for _ in boards]
 
+    # AS5600 feedback bindings: (csv_channel, chain_index, EncoderMap). Each
+    # entry overwrites one driven joint's dead-reckoned angle with its
+    # measured value when a fresh, finite reading is available.
+    enc_bindings: list[tuple[int, int, EncoderMap]] = []
+    if sensor is not None and cfg.sensors is not None:
+        for enc in cfg.sensors.encoders:
+            idx = ik.joint_index.get(enc.joint)
+            if idx is not None:
+                enc_bindings.append((enc.channel, idx, enc))
+
+    # Zero-at-home: recapture each encoder's offset_deg from the reading
+    # taken at launch so it maps to the home angle of its joint. This makes
+    # the encoder feedback agree with the assumed home pose -- wherever the
+    # arm physically sits now is declared home -- so the first feedback tick
+    # leaves q at home instead of snapping it to an uncalibrated reading.
+    if (enc_bindings and sensor is not None and cfg.sensors is not None
+            and cfg.sensors.zero_at_home):
+        deadline = time.monotonic() + 2.0
+        raw_deg: list[float] = []
+        while time.monotonic() < deadline and not stop_flag.is_set():
+            raw_deg, stamp = sensor.snapshot()
+            if (time.monotonic() - stamp) < SENSOR_STALE_SEC and raw_deg:
+                break
+            time.sleep(0.05)
+        for ch, idx, enc in enc_bindings:
+            r = raw_deg[ch] if 0 <= ch < len(raw_deg) else math.nan
+            if math.isfinite(r):
+                enc.offset_deg = offset_for_home(r, q[idx], enc)
+                print(f"ik: zero-at-home {enc.joint}: raw={r:.2f}deg -> "
+                      f"offset_deg={enc.offset_deg:.2f} "
+                      f"(home={math.degrees(q[idx]):.2f}deg)", file=sys.stderr)
+            else:
+                print(f"ik: zero-at-home {enc.joint}: no reading on channel "
+                      f"{ch}, keeping offset_deg={enc.offset_deg:.2f}",
+                      file=sys.stderr)
+
     next_tick = time.monotonic()
     while not stop_flag.is_set():
         next_tick += period
@@ -645,6 +926,18 @@ def integrate_loop(cfg: Config, ik: IkSolver, boards: list[Board],
             axes_snap: list[int] = []
         else:
             axes_snap = js.axes_snapshot()
+
+        # --- Encoder feedback: replace dead-reckoned joint state with the
+        # measured AS5600 angles so the Jacobian is evaluated at the real
+        # pose. Stale frames (sensor unplugged) or NaN channels keep the
+        # dead-reckoned value for that joint. ---
+        if enc_bindings and sensor is not None:
+            raw_deg, stamp = sensor.snapshot()
+            if (time.monotonic() - stamp) < SENSOR_STALE_SEC:
+                for ch, idx, enc in enc_bindings:
+                    r = raw_deg[ch] if 0 <= ch < len(raw_deg) else math.nan
+                    if math.isfinite(r):
+                        q[idx] = encoder_rad(r, enc)
 
         # --- Commanded EE velocity from sticks ------------------------------
         sx = _stick(axes_snap, cfg.cartesian.axis_x, cfg.cartesian.deadzone,
@@ -836,6 +1129,16 @@ def main() -> int:
               f"(check active_joints): {sorted(unknown)}", file=sys.stderr)
         return 1
 
+    # home_joints may pin any chain joint (driven or held, e.g. the wrist),
+    # so validate against all chain link names, not just the driven set.
+    if cfg.cartesian.home_joints is not None:
+        chain_names = {link.name for link in ik.chain.links}
+        unknown_home = set(cfg.cartesian.home_joints) - chain_names
+        if unknown_home:
+            print(f"[cartesian].home_joints references joints not in IK chain: "
+                  f"{sorted(unknown_home)}", file=sys.stderr)
+            return 1
+
     boards: list[Board] = []
     for bcfg in cfg.boards:
         label = bcfg.name or bcfg.serial
@@ -858,6 +1161,23 @@ def main() -> int:
         for board in boards:
             send(board, "enable all\r\n", cfg.log)
 
+    # Optional AS5600 encoder feedback (firmware-sensors board on its own
+    # serial port). Validate the encoder->joint mapping against the IK chain
+    # before opening the port.
+    sensor: SensorReader | None = None
+    if cfg.sensors is not None and cfg.sensors.enabled:
+        unknown_enc = ({e.joint for e in cfg.sensors.encoders}
+                       - set(ik.joint_index.keys()))
+        if unknown_enc:
+            print(f"config [sensors] references joints not in IK chain "
+                  f"(check active_joints): {sorted(unknown_enc)}",
+                  file=sys.stderr)
+            return 1
+        sensor = SensorReader(cfg.sensors.serial, n_channels=4)
+        sensor.start()
+        print(f"sensors: {len(cfg.sensors.encoders)} AS5600 encoder(s) from "
+              f"{cfg.sensors.serial}", file=sys.stderr)
+
     stop_flag = threading.Event()
 
     def on_sigint(_sig, _frm):
@@ -871,7 +1191,7 @@ def main() -> int:
 
     integ = threading.Thread(
         target=integrate_loop,
-        args=(cfg, ik, boards, js, stop_flag),
+        args=(cfg, ik, boards, js, stop_flag, sensor),
         name="integrator",
         daemon=True,
     )
@@ -879,10 +1199,12 @@ def main() -> int:
 
     total_joints = sum(len(b.joints) for b in cfg.boards)
     total_passthrough = sum(len(b.axes) for b in cfg.boards)
+    n_encoders = len(cfg.sensors.encoders) if (sensor is not None and
+                                               cfg.sensors is not None) else 0
     print(
         f"ik-host: device={cfg.device} poll_hz={cfg.poll_hz} "
         f"boards={len(cfg.boards)} ik_joints={total_joints} "
-        f"passthrough_axes={total_passthrough}",
+        f"passthrough_axes={total_passthrough} encoders={n_encoders}",
         file=sys.stderr,
     )
     print("Ctrl-C to stop.", file=sys.stderr)
@@ -894,6 +1216,8 @@ def main() -> int:
         if cfg.safe_stop_on_exit:
             safe_stop(cfg, boards)
         js.stop()
+        if sensor is not None:
+            sensor.stop()
 
     return 130
 
